@@ -263,29 +263,58 @@ def _decode_payload_bundle_text(raw_bundle: str) -> str:
     if not cleaned:
         raise ValueError("Payload bundle is empty")
 
+    if (
+        (cleaned.startswith("\"") and cleaned.endswith("\""))
+        or (cleaned.startswith("'") and cleaned.endswith("'"))
+    ):
+        cleaned = cleaned[1:-1].strip()
+
     if cleaned.startswith("{"):
         return cleaned
 
     compact = "".join(cleaned.split())
-    compact = compact.replace("-", "+").replace("_", "/")
     if not compact:
         raise ValueError("Payload bundle is empty")
 
-    padding = (-len(compact)) % 4
-    if padding:
-        compact += "=" * padding
+    candidate_values: List[str] = [compact]
+    normalized = compact.replace("-", "+").replace("_", "/")
+    if normalized != compact:
+        candidate_values.append(normalized)
 
-    try:
-        decoded_bytes = base64.b64decode(compact, validate=True)
-    except (binascii.Error, ValueError) as e:
+    sanitized = re.sub(r"[^A-Za-z0-9+/=_-]", "", compact)
+    if sanitized and sanitized not in candidate_values:
+        candidate_values.append(sanitized)
+        sanitized_normalized = sanitized.replace("-", "+").replace("_", "/")
+        if sanitized_normalized not in candidate_values:
+            candidate_values.append(sanitized_normalized)
+
+    decode_errors: List[str] = []
+    for candidate in candidate_values:
+        padded_candidate = candidate
+        padding = (-len(padded_candidate)) % 4
+        if padding:
+            padded_candidate += "=" * padding
+
+        try:
+            decoded_bytes = base64.b64decode(padded_candidate, validate=True)
+        except (binascii.Error, ValueError) as e:
+            decode_errors.append(str(e))
+            continue
+
+        try:
+            return decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            decode_errors.append(str(e))
+            continue
+
+    if decode_errors:
+        detail = decode_errors[-1]
         raise ValueError(
-            "Payload bundle must be JSON text (starting with '{') or a valid base64 string"
-        ) from e
+            "Payload bundle must be JSON text (starting with '{') or a valid base64 string "
+            f"(last decode error: {detail})"
+        )
 
-    try:
-        return decoded_bytes.decode("utf-8")
-    except UnicodeDecodeError as e:
-        raise ValueError("Payload bundle base64 content is not valid UTF-8 JSON text") from e
+    raise ValueError("Payload bundle must be JSON text (starting with '{') or a valid base64 string")
 
 
 def _extract_payloads_from_bundle(bundle_payload: Dict[str, Any]) -> List[Dict[str, Any]]:

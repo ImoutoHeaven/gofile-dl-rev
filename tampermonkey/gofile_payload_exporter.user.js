@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoFile Payload Exporter (JSONL)
 // @namespace    https://gofile.io/
-// @version      0.4.0
+// @version      0.4.1
 // @description  Batch fetch GoFile /contents payloads from real browser session and export JSONL.
 // @author       OpenCode
 // @match        https://gofile.io/*
@@ -609,16 +609,29 @@
       return "";
     }
 
+    const payloadLines = jsonl.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!payloadLines.length) {
+      return "";
+    }
+
+    const payloadObjects = [];
+    for (const line of payloadLines) {
+      const parsed = parseJsonSafe(line);
+      if (!parsed || typeof parsed !== "object") {
+        return "";
+      }
+      payloadObjects.push(parsed);
+    }
+
     const accountToken = resolveAccountToken();
-    const lineCount = jsonl.split(/\r?\n/).filter(Boolean).length;
     const bundle = {
       schema: "gofile-payload-bundle/v1",
       accountToken,
-      payloadJsonl: jsonl,
+      payloads: payloadObjects,
       meta: {
         source: "tampermonkey-gofile-payload-exporter",
         generatedAt: new Date().toISOString(),
-        payloadCount: lineCount,
+        payloadCount: payloadObjects.length,
       },
     };
 

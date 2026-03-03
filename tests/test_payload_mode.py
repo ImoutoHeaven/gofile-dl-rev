@@ -234,6 +234,29 @@ def test_parse_payload_bundle_supports_base64url_blob():
     assert payloads == [payload]
 
 
+def test_parse_payload_bundle_supports_quoted_base64_blob_with_newlines():
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "link": "https://cdn.example/a",
+        },
+    }
+    bundle = {
+        "schema": "gofile-payload-bundle/v1",
+        "accountToken": "bundle-token",
+        "payloads": [payload],
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(bundle).encode("utf-8")).decode("ascii").rstrip("=")
+    wrapped = f"'{encoded[:24]}\n{encoded[24:]}'"
+
+    token, payloads = run.parse_payload_bundle(wrapped)
+
+    assert token == "bundle-token"
+    assert payloads == [payload]
+
+
 def test_main_payload_bundle_prompt_mode_parses_double_blank_terminated_input(tmp_path):
     payload = {
         "status": "ok",
