@@ -4,6 +4,9 @@ import binascii
 import logging
 import os
 import sys
+import threading
+from collections import deque
+from queue import Queue
 from pathvalidate import sanitize_filename
 import requests
 from curl_cffi import requests as curl_requests
@@ -45,6 +48,10 @@ DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
 DEFAULT_CONTENTS_PAGE_SIZE = 1000
 NOT_PREMIUM_STATUS = "error-notpremium"
 PAYLOAD_BUNDLE_PROMPT_SENTINEL = "__GOFILE_PAYLOAD_BUNDLE_PROMPT__"
+DEFAULT_DOWNLOAD_CONCURRENCY = 2
+LOW_SPEED_THRESHOLD_BPS = 100 * 1024
+LOW_SPEED_WINDOW_SECONDS = 10
+LOW_SPEED_RECOVERY_SLEEP_SECONDS = 3
 
 
 class _MetaTransportProtocol(Protocol):
@@ -1104,7 +1111,8 @@ class GoFile(metaclass=GoFileMeta):
         self.token: str = ""
         self.wt: str = ""
         self.meta_transport = build_meta_transport()
-        self._download_session: Optional[Any] = None
+        self._download_session_local = threading.local()
+        self._failed_files_lock = threading.Lock()
         self.failed_files: List[Dict[str, Any]] = []
         self.failed_report_dir: Optional[str] = None
         self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
@@ -1114,7 +1122,8 @@ class GoFile(metaclass=GoFileMeta):
 
     def _get_download_session(self) -> Any:
         """Reuse one curl_cffi session with browser impersonation for all file transfers."""
-        if self._download_session is None:
+        session = getattr(self._download_session_local, "session", None)
+        if session is None:
             session_kwargs: Dict[str, Any] = {
                 "impersonate": "chrome",
                 "default_headers": True,
@@ -1122,12 +1131,14 @@ class GoFile(metaclass=GoFileMeta):
             proxy_server = read_proxy_from_env()
             if proxy_server:
                 session_kwargs["proxy"] = proxy_server
-            self._download_session = curl_requests.Session(**session_kwargs)
-        return self._download_session
+            session = curl_requests.Session(**session_kwargs)
+            self._download_session_local.session = session
+        return session
 
     def clear_failed_files(self) -> None:
         """Reset in-memory failed download records for a new run."""
-        self.failed_files = []
+        with self._failed_files_lock:
+            self.failed_files = []
 
     def set_failed_report_dir(self, out_dir: str) -> None:
         """Configure output directory used for immediate failed_files flush."""
@@ -1162,10 +1173,10 @@ class GoFile(metaclass=GoFileMeta):
             entry["size"] = expected_size
         if expected_md5:
             entry["md5"] = expected_md5.lower()
-        self.failed_files.append(entry)
-
-        if self.failed_report_dir:
-            write_failed_files_report(self.failed_files, self.failed_report_dir)
+        with self._failed_files_lock:
+            self.failed_files.append(entry)
+            if self.failed_report_dir:
+                write_failed_files_report(list(self.failed_files), self.failed_report_dir)
 
     @staticmethod
     def _read_ttl_env(env_name: str, default_value: int) -> int:
@@ -1202,6 +1213,359 @@ class GoFile(metaclass=GoFileMeta):
         if include_website_token and self.wt:
             headers["X-Website-Token"] = self.wt
         return headers
+
+    def _fetch_content_payload(
+        self,
+        content_id: str,
+        password: Optional[str] = None,
+        auth_retry: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one /contents payload with optional auth refresh retry."""
+        request_params = self._build_contents_params(password=password)
+        request_headers = self._build_contents_headers(include_website_token=True)
+        url = f"https://api.gofile.io/contents/{content_id}"
+
+        try:
+            data = self.meta_transport.request_json(
+                "GET",
+                url,
+                headers=request_headers,
+                params=request_params,
+                timeout=DEFAULT_TIMEOUT,
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch content {content_id}: {e}")
+            return None
+
+        status, details = parse_api_error_details(data)
+
+        if (
+            status.strip().lower() == NOT_PREMIUM_STATUS
+            and "X-Website-Token" in request_headers
+        ):
+            logger.warning(
+                "API error [error-notPremium], retrying once without X-Website-Token"
+            )
+            try:
+                data = self.meta_transport.request_json(
+                    "GET",
+                    url,
+                    headers=self._build_contents_headers(include_website_token=False),
+                    params=request_params,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to fetch content {content_id} without website token: {e}"
+                )
+                return None
+            status, details = parse_api_error_details(data)
+
+        if data.get("status") != "ok":
+            if auth_retry and should_refresh_auth(status):
+                logger.warning(
+                    f"API error [{status}], forcing credential refresh and retrying once: {details}"
+                )
+                self.update_token(force_refresh=True)
+                self.update_wt(force_refresh=True)
+                return self._fetch_content_payload(
+                    content_id=content_id,
+                    password=password,
+                    auth_retry=False,
+                )
+
+            logger.error(f"API error [{status}]: {details}")
+            return None
+
+        return data
+
+    def _collect_content_children_items(
+        self,
+        children: Dict[str, Dict[str, Any]],
+        parent_dir: str,
+        password: Optional[str],
+        strip_emojis: bool,
+        auth_retry: bool,
+        cancel_event: Optional[Any] = None,
+        incremental: bool = False,
+        tracker: Optional[DownloadTracker] = None,
+    ) -> List[Dict[str, Any]]:
+        """Recursively resolve nested folder payloads into flat download items."""
+        items: List[Dict[str, Any]] = []
+
+        for child_id, child in children.items():
+            if cancel_event and cancel_event.is_set():
+                break
+
+            if not isinstance(child, dict):
+                continue
+
+            child_type = str(child.get("type", "file")).lower()
+
+            if child_type == "folder":
+                nested_payload = self._fetch_content_payload(
+                    content_id=str(child_id),
+                    password=password,
+                    auth_retry=auth_retry,
+                )
+                if not nested_payload:
+                    continue
+
+                nested_data = nested_payload.get("data")
+                if not isinstance(nested_data, dict):
+                    logger.warning("Folder payload for %s missing data object", child_id)
+                    continue
+
+                folder_name = str(nested_data.get("name") or child.get("name") or "").strip()
+                if strip_emojis and folder_name:
+                    folder_name = strip_emojis_func(folder_name)
+                if not folder_name:
+                    folder_name = f"folder_{str(child_id)[:8]}"
+
+                safe_folder_name = sanitize_filename(folder_name)
+                if incremental and tracker:
+                    existing_folder = tracker.find_existing_folder(folder_name, parent_dir)
+                    if existing_folder:
+                        nested_dir = existing_folder
+                    else:
+                        nested_dir = os.path.join(parent_dir, safe_folder_name)
+                else:
+                    nested_dir = os.path.join(parent_dir, safe_folder_name)
+
+                try:
+                    os.makedirs(nested_dir, exist_ok=True)
+                except PermissionError as e:
+                    logger.error(f"Permission denied creating folder '{nested_dir}': {e}")
+                    raise PermissionError(
+                        f"Cannot create folder '{nested_dir}': Permission denied. "
+                        "Check Docker volume permissions."
+                    )
+                except OSError as e:
+                    logger.error(f"OS error creating folder '{nested_dir}': {e}")
+                    raise OSError(f"Cannot create folder '{nested_dir}': {e}")
+
+                nested_children = nested_data.get("children", {})
+                if not nested_children:
+                    nested_children = nested_data.get("contents", {})
+
+                if not isinstance(nested_children, dict) or not nested_children:
+                    logger.warning(
+                        "No children found in folder %s (%s)",
+                        child_id,
+                        nested_data.get("name", "folder"),
+                    )
+                    continue
+
+                items.extend(
+                    self._collect_content_children_items(
+                        children=nested_children,
+                        parent_dir=nested_dir,
+                        password=password,
+                        strip_emojis=strip_emojis,
+                        auth_retry=auth_retry,
+                        cancel_event=cancel_event,
+                        incremental=incremental,
+                        tracker=tracker,
+                    )
+                )
+                continue
+
+            raw_filename = str(child.get("name", "unknown"))
+            tracker_name = raw_filename
+            file_name = raw_filename
+
+            if strip_emojis:
+                file_name = strip_emojis_func(file_name)
+                if not file_name:
+                    ext = os.path.splitext(raw_filename)[1]
+                    file_name = f"file_{str(child_id)[:8]}{ext}"
+
+            file_path = os.path.join(parent_dir, sanitize_filename(file_name))
+            link = child.get("link") if isinstance(child.get("link"), str) else ""
+
+            item: Dict[str, Any] = {
+                "link": link,
+                "file_path": file_path,
+                "file_id": str(child_id),
+                "tracker_name": tracker_name,
+            }
+
+            expected_size = _parse_optional_int(child.get("size"))
+            if expected_size is not None:
+                item["size"] = expected_size
+
+            md5_value = child.get("md5")
+            if isinstance(md5_value, str) and md5_value.strip():
+                item["md5"] = md5_value.strip().lower()
+
+            items.append(item)
+
+        return items
+
+    def _download_items_with_workers(
+        self,
+        items: List[Dict[str, Any]],
+        progress_label: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        cancel_event: Optional[Any] = None,
+        overall_progress_callback: Optional[Callable[[int, str], None]] = None,
+        file_progress_callback: Optional[Callable[..., None]] = None,
+        pause_callback: Optional[Callable[[], bool]] = None,
+        throttle_speed: Optional[int] = None,
+        retry_attempts: int = 0,
+        failed_base_dir: str = "",
+        incremental: bool = False,
+        tracker: Optional[DownloadTracker] = None,
+    ) -> None:
+        """Download queued items with a fixed-size worker pool."""
+        if not items:
+            if callable(overall_progress_callback):
+                overall_progress_callback(100, progress_label)
+            return
+
+        total_jobs = len(items)
+        job_queue: Queue[Optional[Dict[str, Any]]] = Queue()
+        for item in items:
+            job_queue.put(item)
+
+        worker_count = min(DEFAULT_DOWNLOAD_CONCURRENCY, total_jobs)
+        for _ in range(worker_count):
+            job_queue.put(None)
+
+        completed_jobs = 0
+        progress_lock = threading.Lock()
+        tracker_lock = threading.Lock()
+
+        def _worker() -> None:
+            nonlocal completed_jobs
+            while True:
+                item = job_queue.get()
+                should_count = isinstance(item, dict)
+
+                try:
+                    if item is None:
+                        return
+
+                    file_path = str(item.get("file_path", ""))
+                    link = item.get("link") if isinstance(item.get("link"), str) else ""
+                    expected_size = _parse_optional_int(item.get("size"))
+                    expected_md5 = item.get("md5") if isinstance(item.get("md5"), str) else None
+                    file_id = item.get("file_id")
+                    tracker_name = item.get("tracker_name")
+
+                    if (
+                        incremental
+                        and tracker
+                        and isinstance(file_id, str)
+                        and isinstance(tracker_name, str)
+                    ):
+                        with tracker_lock:
+                            already_downloaded = tracker.is_downloaded(file_id, tracker_name)
+                        if already_downloaded:
+                            logger.info(f"Skipping already downloaded file: {tracker_name}")
+                            if callable(file_progress_callback):
+                                file_progress_callback(file_path, 100)
+                            continue
+
+                    if item.get("check_existing_payload"):
+                        if is_payload_file_already_downloaded(
+                            file_path,
+                            expected_size=expected_size,
+                            expected_md5=expected_md5,
+                        ):
+                            logger.info(f"Skipping already downloaded payload file: {file_path}")
+                            if callable(file_progress_callback):
+                                file_progress_callback(file_path, 100)
+                            continue
+
+                    if cancel_event and cancel_event.is_set():
+                        logger.info("Download cancelled")
+                        continue
+
+                    if not link:
+                        logger.error(f"No download link for file: {file_path}")
+                        self._record_failed_file(
+                            link="",
+                            file_path=file_path,
+                            error="missing direct download link",
+                            base_dir=failed_base_dir,
+                            expected_size=expected_size,
+                            expected_md5=expected_md5,
+                        )
+                        continue
+
+                    if callable(file_progress_callback):
+                        file_progress_callback(file_path, 0)
+
+                    was_downloaded = self.download(
+                        link=link,
+                        file=file_path,
+                        progress_callback=progress_callback,
+                        cancel_event=cancel_event,
+                        file_progress_callback=file_progress_callback,
+                        pause_callback=pause_callback,
+                        throttle_speed=throttle_speed,
+                        retry_attempts=retry_attempts,
+                    )
+
+                    if was_downloaded:
+                        if (
+                            incremental
+                            and tracker
+                            and isinstance(file_id, str)
+                            and isinstance(tracker_name, str)
+                        ):
+                            with tracker_lock:
+                                tracker.mark_downloaded(file_id, tracker_name)
+                        if callable(file_progress_callback):
+                            file_progress_callback(file_path, 100)
+                    else:
+                        self._record_failed_file(
+                            link=link,
+                            file_path=file_path,
+                            error="download failed after retries",
+                            base_dir=failed_base_dir,
+                            expected_size=expected_size,
+                            expected_md5=expected_md5,
+                        )
+                except Exception as worker_error:
+                    job_path = "unknown"
+                    if isinstance(item, dict):
+                        job_path = str(item.get("file_path", "unknown"))
+                    logger.error("Worker error processing %s: %s", job_path, worker_error)
+
+                    if isinstance(item, dict):
+                        failed_path = str(item.get("file_path", ""))
+                        raw_link = item.get("link")
+                        failed_link = str(raw_link) if isinstance(raw_link, str) else ""
+                        failed_size = _parse_optional_int(item.get("size"))
+                        failed_md5 = item.get("md5") if isinstance(item.get("md5"), str) else None
+                        if failed_path:
+                            self._record_failed_file(
+                                link=failed_link,
+                                file_path=failed_path,
+                                error=f"worker error: {worker_error}",
+                                base_dir=failed_base_dir,
+                                expected_size=failed_size,
+                                expected_md5=failed_md5,
+                            )
+                finally:
+                    if should_count:
+                        with progress_lock:
+                            completed_jobs += 1
+                            percent = int((completed_jobs / total_jobs) * 100)
+                            if callable(overall_progress_callback):
+                                overall_progress_callback(percent, progress_label)
+                    job_queue.task_done()
+
+        workers = [
+            threading.Thread(target=_worker, name=f"gofile-worker-{idx + 1}", daemon=True)
+            for idx in range(worker_count)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
 
     def _load_credential_cache(self) -> None:
         """Load cached account token and website token when still fresh."""
@@ -1405,306 +1769,144 @@ class GoFile(metaclass=GoFileMeta):
             # Initialize tracker for incremental mode
             if incremental and tracker is None:
                 tracker = DownloadTracker(dir, content_id, folder_pattern)
-            
-            request_params = self._build_contents_params(password=password)
-            request_headers = self._build_contents_headers(include_website_token=True)
-            
-            try:
-                data = self.meta_transport.request_json(
-                    "GET",
-                    f"https://api.gofile.io/contents/{content_id}",
-                    headers=request_headers,
-                    params=request_params,
-                    timeout=DEFAULT_TIMEOUT,
-                )
-            except Exception as e:
-                logger.error(f"Failed to fetch content {content_id}: {e}")
+
+            data = self._fetch_content_payload(
+                content_id=content_id,
+                password=password,
+                auth_retry=auth_retry,
+            )
+            if not data:
                 return
-            if data.get("status") != "ok":
-                status, details = parse_api_error_details(data)
 
-                if (
-                    auth_retry
-                    and status.strip().lower() == NOT_PREMIUM_STATUS
-                    and "X-Website-Token" in request_headers
-                ):
-                    logger.warning(
-                        "API error [error-notPremium], retrying once without X-Website-Token"
-                    )
-                    try:
-                        data = self.meta_transport.request_json(
-                            "GET",
-                            f"https://api.gofile.io/contents/{content_id}",
-                            headers=self._build_contents_headers(include_website_token=False),
-                            params=request_params,
-                            timeout=DEFAULT_TIMEOUT,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to fetch content {content_id} without website token: {e}"
-                        )
-                        return
-                    if data.get("status") == "ok":
-                        status = "ok"
-                    else:
-                        status, details = parse_api_error_details(data)
-
-                if data.get("status") != "ok":
-                    if auth_retry and should_refresh_auth(status):
-                        logger.warning(
-                            f"API error [{status}], forcing credential refresh and retrying once: {details}"
-                        )
-                        self.update_token(force_refresh=True)
-                        self.update_wt(force_refresh=True)
-                        self.execute(
-                            dir=dir,
-                            content_id=content_id,
-                            password=password,
-                            progress_callback=progress_callback,
-                            cancel_event=cancel_event,
-                            name_callback=name_callback,
-                            overall_progress_callback=overall_progress_callback,
-                            start_time=start_time,
-                            file_progress_callback=file_progress_callback,
-                            pause_callback=pause_callback,
-                            throttle_speed=throttle_speed,
-                            retry_attempts=retry_attempts,
-                            strip_emojis=strip_emojis,
-                            incremental=incremental,
-                            tracker=tracker,
-                            folder_pattern=folder_pattern,
-                            auth_retry=False,
-                            failed_base_dir=failed_base_dir,
-                        )
-                        return
-
-                    logger.error(f"API error [{status}]: {details}")
-                    return
-            if data["data"].get("passwordStatus", "passwordOk") != "passwordOk":
-                logger.error("Invalid password: %s", data["data"].get("passwordStatus"))
+            root_data = data.get("data")
+            if not isinstance(root_data, dict):
+                logger.error("Payload for %s missing content data", content_id)
                 return
-            if data["data"]["type"] == "folder":
-                dirname = data["data"]["name"]
-                
-                # Strip emojis if requested
+
+            if root_data.get("passwordStatus", "passwordOk") != "passwordOk":
+                logger.error("Invalid password: %s", root_data.get("passwordStatus"))
+                return
+
+            root_type = str(root_data.get("type", "file")).lower()
+            if root_type == "folder":
+                dirname = str(root_data.get("name", "folder"))
+
                 if strip_emojis:
                     dirname_clean = strip_emojis_func(dirname)
-                    if not dirname_clean:  # If name becomes empty after stripping
+                    if not dirname_clean:
                         dirname = f"folder_{content_id[:8]}"
                     else:
                         dirname = dirname_clean
-                
-                if name_callback:
-                    name_callback(sanitize_filename(dirname))
-                
-                # Check for existing folder (handles renames in incremental mode)
+
+                safe_dirname = sanitize_filename(dirname)
+                if callable(name_callback):
+                    name_callback(safe_dirname)
+
                 if incremental and tracker:
                     existing_folder = tracker.find_existing_folder(dirname, dir)
                     if existing_folder:
                         logger.info(f"Using existing folder: {existing_folder}")
                         folder_path = existing_folder
                     else:
-                        folder_path = os.path.join(dir, sanitize_filename(dirname))
+                        folder_path = os.path.join(dir, safe_dirname)
                 else:
-                    folder_path = os.path.join(dir, sanitize_filename(dirname))
-                
-                # Create folder with better error handling
+                    folder_path = os.path.join(dir, safe_dirname)
+
                 try:
                     os.makedirs(folder_path, exist_ok=True)
                 except PermissionError as e:
                     logger.error(f"Permission denied creating folder '{folder_path}': {e}")
-                    logger.error(f"Check that the parent directory is writable. Current user UID: {os.getuid()}")
-                    raise PermissionError(f"Cannot create folder '{folder_path}': Permission denied. Check Docker volume permissions.")
+                    logger.error(
+                        f"Check that the parent directory is writable. Current user UID: {os.getuid()}"
+                    )
+                    raise PermissionError(
+                        f"Cannot create folder '{folder_path}': Permission denied. "
+                        "Check Docker volume permissions."
+                    )
                 except OSError as e:
                     logger.error(f"OS error creating folder '{folder_path}': {e}")
                     raise OSError(f"Cannot create folder '{folder_path}': {e}")
-                
-                # Get children - they might be in 'children' or 'contents' depending on API version
-                children = data["data"].get("children", {})
-                if not children:
-                    children = data["data"].get("contents", {})
-                
-                if not children:
-                    logger.warning(f"No children found in folder {content_id} ({dirname})")
-                    # Don't return - empty folders are valid
-                    if overall_progress_callback:
-                        folder_name = data["data"].get("name", "folder")
-                        overall_progress_callback(100, folder_name)
-                    return
-                
-                # Calculate progress for THIS folder only (not recursive)
-                overall_total = float(len(children))
-                files_completed = 0.0
-                
-                for child_id, child in children.items():
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    
-                    try:
-                        child_type = child.get("type", "file")
-                        
-                        if child_type == "folder":
-                            # Recursively process subfolder
-                            logger.info(f"Processing subfolder: {child.get('name', child_id)}")
-                            
-                            # Recursively download subfolder contents
-                            # Note: Progress tracking for subfolders is approximate since we need
-                            # to make API calls to get their contents
-                            self.execute(
-                                dir=folder_path, 
-                                content_id=child_id, 
-                                password=password,
-                                progress_callback=progress_callback, 
-                                cancel_event=cancel_event,
-                                name_callback=None,  # Don't update main task name for subfolders
-                                overall_progress_callback=overall_progress_callback,
-                                start_time=start_time, 
-                                file_progress_callback=file_progress_callback,
-                                pause_callback=pause_callback, 
-                                throttle_speed=throttle_speed,
-                                retry_attempts=retry_attempts,
-                                strip_emojis=strip_emojis,
-                                incremental=incremental,
-                                tracker=tracker,
-                                folder_pattern=folder_pattern,
-                                auth_retry=auth_retry,
-                                failed_base_dir=failed_base_dir,
-                            )
-                            files_completed += 1.0  # Count the folder as processed
-                            
-                        else:
-                            # Download file
-                            filename = child.get("name", "unknown")
-                            
-                            # Check if already downloaded in incremental mode
-                            if incremental and tracker and tracker.is_downloaded(child_id, filename):
-                                logger.info(f"Skipping already downloaded file: {filename}")
-                                files_completed += 1.0
-                                if callable(file_progress_callback):
-                                    file_path = os.path.join(folder_path, sanitize_filename(filename))
-                                    file_progress_callback(file_path, 100)
-                                continue
-                            
-                            # Strip emojis if requested
-                            if strip_emojis:
-                                filename_clean = strip_emojis_func(filename)
-                                if not filename_clean:  # If name becomes empty after stripping
-                                    # Keep extension if present
-                                    ext = os.path.splitext(filename)[1]
-                                    filename = f"file_{child_id[:8]}{ext}"
-                                else:
-                                    filename = filename_clean
-                            
-                            file_path = os.path.join(folder_path, sanitize_filename(filename))
-                            link = child.get("link", "")
-                            child_size = _parse_optional_int(child.get("size"))
-                            child_md5 = child.get("md5") if isinstance(child.get("md5"), str) else None
-                              
-                            if not link:
-                                logger.error(f"No download link for file: {filename}")
-                                self._record_failed_file(
-                                    link="",
-                                    file_path=file_path,
-                                    error="missing direct download link",
-                                    base_dir=failed_base_dir,
-                                    expected_size=child_size,
-                                    expected_md5=child_md5,
-                                )
-                                files_completed += 1.0
-                                continue
-                            
-                            logger.info(f"Downloading file: {filename}")
-                            
-                            if callable(file_progress_callback):
-                                file_progress_callback(file_path, 0)  # register start (0%)
-                            
-                            was_downloaded = self.download(
-                                link, file_path, 
-                                progress_callback=progress_callback,
-                                cancel_event=cancel_event, 
-                                file_progress_callback=file_progress_callback,
-                                pause_callback=pause_callback, 
-                                throttle_speed=throttle_speed,
-                                retry_attempts=retry_attempts
-                            )
-                            
-                            if was_downloaded:
-                                # Mark as downloaded in incremental mode
-                                if incremental and tracker:
-                                    tracker.mark_downloaded(child_id, filename)
 
-                                if callable(file_progress_callback):
-                                    file_progress_callback(file_path, 100)  # file complete
-                            else:
-                                self._record_failed_file(
-                                    link=link,
-                                    file_path=file_path,
-                                    error="download failed after retries",
-                                    base_dir=failed_base_dir,
-                                    expected_size=child_size,
-                                    expected_md5=child_md5,
-                                )
-                             
-                            files_completed += 1.0
-                            
-                    except Exception as e_inner:
-                        logger.error(f"Error processing child {child_id}: {e_inner}")
-                        files_completed += 1.0  # Count as processed even if failed
-                        continue
-                    
-                    # Update progress after each child in this folder
-                    if overall_progress_callback and overall_total > 0:
-                        percent = int((files_completed / overall_total) * 100)
-                        folder_name = data["data"].get("name", "folder")
-                        overall_progress_callback(percent, folder_name)
-                
-                # Mark this folder as complete
-                if overall_progress_callback:
-                    folder_name = data["data"].get("name", "folder")
-                    overall_progress_callback(100, folder_name)
-            else:
-                filename = data["data"]["name"]
-                
-                # Strip emojis if requested
-                if strip_emojis:
-                    filename_clean = strip_emojis_func(filename)
-                    if not filename_clean:  # If name becomes empty after stripping
-                        # Keep extension if present
-                        ext = os.path.splitext(filename)[1]
-                        filename = f"file_{content_id[:8]}{ext}"
-                    else:
-                        filename = filename_clean
-                
-                file_path = os.path.join(dir, sanitize_filename(filename))
-                link = data["data"]["link"]
-                file_size = _parse_optional_int(data["data"].get("size"))
-                file_md5 = data["data"].get("md5") if isinstance(data["data"].get("md5"), str) else None
-                if callable(name_callback):
-                    name_callback(sanitize_filename(filename))
-                if callable(file_progress_callback):
-                    file_progress_callback(file_path, 0)
-                was_downloaded = self.download(
-                    link,
-                    file_path,
+                children = root_data.get("children", {})
+                if not children:
+                    children = root_data.get("contents", {})
+
+                if not isinstance(children, dict) or not children:
+                    logger.warning(f"No children found in folder {content_id} ({dirname})")
+                    if callable(overall_progress_callback):
+                        overall_progress_callback(100, root_data.get("name", "folder"))
+                    return
+
+                items = self._collect_content_children_items(
+                    children=children,
+                    parent_dir=folder_path,
+                    password=password,
+                    strip_emojis=strip_emojis,
+                    auth_retry=auth_retry,
+                    cancel_event=cancel_event,
+                    incremental=incremental,
+                    tracker=tracker,
+                )
+
+                self._download_items_with_workers(
+                    items=items,
+                    progress_label=str(root_data.get("name", "folder")),
                     progress_callback=progress_callback,
                     cancel_event=cancel_event,
+                    overall_progress_callback=overall_progress_callback,
                     file_progress_callback=file_progress_callback,
                     pause_callback=pause_callback,
                     throttle_speed=throttle_speed,
                     retry_attempts=retry_attempts,
+                    failed_base_dir=failed_base_dir,
+                    incremental=incremental,
+                    tracker=tracker,
                 )
-                if was_downloaded:
-                    if callable(file_progress_callback):
-                        file_progress_callback(file_path, 100)
-                else:
-                    self._record_failed_file(
-                        link=link,
-                        file_path=file_path,
-                        error="download failed after retries",
-                        base_dir=failed_base_dir,
-                        expected_size=file_size,
-                        expected_md5=file_md5,
-                    )
+            else:
+                original_filename = str(root_data.get("name", "unknown"))
+                filename = original_filename
+
+                if strip_emojis:
+                    filename_clean = strip_emojis_func(filename)
+                    if not filename_clean:
+                        ext = os.path.splitext(original_filename)[1]
+                        filename = f"file_{content_id[:8]}{ext}"
+                    else:
+                        filename = filename_clean
+
+                file_path = os.path.join(dir, sanitize_filename(filename))
+                link = root_data.get("link") if isinstance(root_data.get("link"), str) else ""
+
+                item: Dict[str, Any] = {
+                    "link": link,
+                    "file_path": file_path,
+                    "file_id": str(content_id),
+                    "tracker_name": original_filename,
+                }
+                file_size = _parse_optional_int(root_data.get("size"))
+                if file_size is not None:
+                    item["size"] = file_size
+                file_md5 = root_data.get("md5") if isinstance(root_data.get("md5"), str) else None
+                if isinstance(file_md5, str) and file_md5.strip():
+                    item["md5"] = file_md5
+
+                if callable(name_callback):
+                    name_callback(sanitize_filename(filename))
+
+                self._download_items_with_workers(
+                    items=[item],
+                    progress_label=sanitize_filename(filename),
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                    overall_progress_callback=overall_progress_callback,
+                    file_progress_callback=file_progress_callback,
+                    pause_callback=pause_callback,
+                    throttle_speed=throttle_speed,
+                    retry_attempts=retry_attempts,
+                    failed_base_dir=failed_base_dir,
+                    incremental=incremental,
+                    tracker=tracker,
+                )
         elif url is not None:
             normalized_url = normalize_gofile_url(url)
             if normalized_url is None:
@@ -1754,61 +1956,27 @@ class GoFile(metaclass=GoFileMeta):
             logger.warning("No downloadable links found in provided payload")
             return
 
-        total_jobs = len(items)
-        for index, item in enumerate(items, start=1):
+        queued_items: List[Dict[str, Any]] = []
+        for item in items:
             if cancel_event and cancel_event.is_set():
                 logger.info("Payload download cancelled")
                 break
+            queued_item = dict(item)
+            queued_item["check_existing_payload"] = True
+            queued_items.append(queued_item)
 
-            link = item["link"]
-            file_path = item["file_path"]
-            expected_size = item.get("size")
-            expected_md5 = item.get("md5")
-
-            if is_payload_file_already_downloaded(
-                file_path,
-                expected_size=expected_size,
-                expected_md5=expected_md5,
-            ):
-                logger.info(f"Skipping already downloaded payload file: {file_path}")
-                if callable(file_progress_callback):
-                    file_progress_callback(file_path, 100)
-                if callable(overall_progress_callback):
-                    overall_percent = int(index * 100 / total_jobs)
-                    overall_progress_callback(overall_percent, "payload")
-                continue
-
-            logger.info(f"Downloading payload file {index}/{total_jobs}: {file_path}")
-            if callable(file_progress_callback):
-                file_progress_callback(file_path, 0)
-
-            was_downloaded = self.download(
-                link=link,
-                file=file_path,
-                progress_callback=progress_callback,
-                cancel_event=cancel_event,
-                file_progress_callback=file_progress_callback,
-                pause_callback=pause_callback,
-                throttle_speed=throttle_speed,
-                retry_attempts=retry_attempts,
-            )
-
-            if was_downloaded:
-                if callable(file_progress_callback):
-                    file_progress_callback(file_path, 100)
-            else:
-                self._record_failed_file(
-                    link=link,
-                    file_path=file_path,
-                    error="download failed after retries",
-                    base_dir=dir,
-                    expected_size=expected_size,
-                    expected_md5=expected_md5,
-                )
-
-            if callable(overall_progress_callback):
-                overall_percent = int(index * 100 / total_jobs)
-                overall_progress_callback(overall_percent, "payload")
+        self._download_items_with_workers(
+            items=queued_items,
+            progress_label="payload",
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            overall_progress_callback=overall_progress_callback,
+            file_progress_callback=file_progress_callback,
+            pause_callback=pause_callback,
+            throttle_speed=throttle_speed,
+            retry_attempts=retry_attempts,
+            failed_base_dir=dir,
+        )
     
     def download(self, 
                 link: str, 
@@ -1844,8 +2012,6 @@ class GoFile(metaclass=GoFileMeta):
         """
         temp = file + ".part"
         attempts = 0
-        bytes_since_last_check = 0
-        last_check_time = time.time()
         
         while attempts <= retry_attempts:
             try:
@@ -1864,15 +2030,26 @@ class GoFile(metaclass=GoFileMeta):
                 response = self._get_download_session().get(link, **request_kwargs)
                 try:
                     response.raise_for_status()
-                    total_size = int(response.headers.get("Content-Length", 0)) + size
+                    content_length = _parse_optional_int(response.headers.get("Content-Length"))
+                    has_known_total = content_length is not None
+                    total_size = size + (content_length if content_length is not None else 0)
+                    reported_size = total_size if has_known_total else None
                     downloaded = size
+                    bytes_since_last_check = 0
+                    last_check_time = time.time()
+                    speed_window: deque[Tuple[float, int]] = deque()
+                    window_bytes = 0
+                    low_speed_guard_enabled = True
                     
                     # Register file with its size information
                     if file_progress_callback:
-                        file_progress_callback(file, 0, size=total_size)  # Pass size here
+                        file_progress_callback(file, 0, size=reported_size)
                     
                     with open(temp, "ab") as f:
                         for chunk in response.iter_content(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
+
                             # Check for pause - if paused, wait until unpaused
                             if pause_callback and pause_callback():
                                 while pause_callback():
@@ -1880,15 +2057,47 @@ class GoFile(metaclass=GoFileMeta):
                         
                             f.write(chunk)
                             downloaded += len(chunk)
-                            if progress_callback:
+                            percentage = 0
+                            if has_known_total and total_size > 0:
                                 percentage = int(downloaded * 100 / total_size)
+                            if progress_callback:
                                 progress_callback(percentage)
                             if file_progress_callback:
-                                file_progress_callback(file, int(downloaded * 100 / total_size), size=total_size)
+                                file_progress_callback(file, percentage, size=reported_size)
                             if cancel_event and cancel_event.is_set():
                                 logger.info("Download cancelled")
                                 raise Exception("Cancelled")
-                            
+
+                            if low_speed_guard_enabled:
+                                now = time.time()
+                                previous_sample_time = speed_window[-1][0] if speed_window else None
+                                speed_window.append((now, len(chunk)))
+                                window_bytes += len(chunk)
+
+                                while speed_window and now - speed_window[0][0] > LOW_SPEED_WINDOW_SECONDS:
+                                    _, expired_size = speed_window.popleft()
+                                    window_bytes -= expired_size
+
+                                avg_rate: Optional[float] = None
+                                if speed_window:
+                                    window_span = now - speed_window[0][0]
+                                    if window_span >= LOW_SPEED_WINDOW_SECONDS and window_span > 0:
+                                        avg_rate = window_bytes / window_span
+                                if avg_rate is None and previous_sample_time is not None:
+                                    sparse_span = now - previous_sample_time
+                                    if sparse_span >= LOW_SPEED_WINDOW_SECONDS and sparse_span > 0:
+                                        avg_rate = len(chunk) / sparse_span
+
+                                if avg_rate is not None and avg_rate < LOW_SPEED_THRESHOLD_BPS:
+                                    logger.warning(
+                                        "Stream speed %.1f KB/s below 100.0 KB/s, pausing stream for %ss",
+                                        avg_rate / 1024,
+                                        LOW_SPEED_RECOVERY_SLEEP_SECONDS,
+                                    )
+                                    time.sleep(LOW_SPEED_RECOVERY_SLEEP_SECONDS)
+                                    speed_window.clear()
+                                    window_bytes = 0
+                             
                             # Apply throttling if needed
                             if throttle_speed:
                                 bytes_since_last_check += len(chunk)
@@ -1911,7 +2120,7 @@ class GoFile(metaclass=GoFileMeta):
                     # Rename temp file to final file when download is complete
                     os.rename(temp, file)
                     if file_progress_callback:
-                        file_progress_callback(file, 100, size=total_size)
+                        file_progress_callback(file, 100, size=reported_size)
                     logger.info(f"Downloaded: {file} ({link})")
                     
                     # Download was successful, exit the retry loop

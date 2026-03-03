@@ -2,6 +2,9 @@ import json
 import base64
 import os
 import sys
+import threading
+import time
+from typing import cast
 
 import pytest
 
@@ -646,3 +649,343 @@ def test_download_session_uses_proxy_env(monkeypatch, tmp_path):
 
     assert ok is True
     assert observed_session_kwargs.get("proxy") == "http://127.0.0.1:7890"
+
+
+def test_execute_payload_downloads_with_two_workers(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "folder",
+            "name": "Root",
+            "children": {
+                "file-1": {"type": "file", "name": "A.bin", "link": "https://cdn.example/a"},
+                "file-2": {"type": "file", "name": "B.bin", "link": "https://cdn.example/b"},
+                "file-3": {"type": "file", "name": "C.bin", "link": "https://cdn.example/c"},
+                "file-4": {"type": "file", "name": "D.bin", "link": "https://cdn.example/d"},
+            },
+        },
+    }
+
+    active_downloads = 0
+    max_active_downloads = 0
+    lock = threading.Lock()
+
+    def _fake_download(_link=None, _file=None, **_kwargs):
+        if _link is None:
+            _link = _kwargs.get("link")
+        if _file is None:
+            _file = _kwargs.get("file")
+        assert _link
+        assert _file
+        nonlocal active_downloads, max_active_downloads
+        with lock:
+            active_downloads += 1
+            max_active_downloads = max(max_active_downloads, active_downloads)
+        time.sleep(0.05)
+        with lock:
+            active_downloads -= 1
+        return True
+
+    monkeypatch.setattr(client, "download", _fake_download)
+
+    client.execute_payload(dir=str(tmp_path), payload=payload)
+
+    assert max_active_downloads == 2
+
+
+def test_execute_downloads_with_two_workers_for_contents_api(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.token = "token-123"
+    client.wt = "wt-123"
+
+    class _FakeMetaTransport:
+        def request_json(self, method, url, headers=None, params=None, timeout=10, credentials="include"):
+            del method, headers, params, timeout, credentials
+            content_id = url.rsplit("/", 1)[-1]
+            assert content_id == "root-folder"
+            return {
+                "status": "ok",
+                "data": {
+                    "type": "folder",
+                    "name": "Root",
+                    "children": {
+                        "file-1": {"type": "file", "name": "A.bin", "link": "https://cdn.example/a"},
+                        "file-2": {"type": "file", "name": "B.bin", "link": "https://cdn.example/b"},
+                        "file-3": {"type": "file", "name": "C.bin", "link": "https://cdn.example/c"},
+                        "file-4": {"type": "file", "name": "D.bin", "link": "https://cdn.example/d"},
+                    },
+                },
+            }
+
+        def request_text(self, method, url, headers=None, params=None, timeout=10, credentials="include"):
+            del method, url, headers, params, timeout, credentials
+            return 'appdata.wt = "wt-123"'
+
+    client.meta_transport = _FakeMetaTransport()
+
+    active_downloads = 0
+    max_active_downloads = 0
+    lock = threading.Lock()
+
+    def _fake_download(_link=None, _file=None, **_kwargs):
+        if _link is None:
+            _link = _kwargs.get("link")
+        if _file is None:
+            _file = _kwargs.get("file")
+        assert _link
+        assert _file
+        nonlocal active_downloads, max_active_downloads
+        with lock:
+            active_downloads += 1
+            max_active_downloads = max(max_active_downloads, active_downloads)
+        time.sleep(0.05)
+        with lock:
+            active_downloads -= 1
+        return True
+
+    monkeypatch.setattr(client, "download", _fake_download)
+
+    client.execute(dir=str(tmp_path), content_id="root-folder")
+
+    assert max_active_downloads == 2
+
+
+def test_download_pauses_and_recovers_when_10s_average_below_threshold(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    fake_clock = [0.0]
+    sleep_calls = []
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {"Content-Length": str(11 * 10 * 1024)}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            for _ in range(11):
+                fake_clock[0] += 1.0
+                yield b"x" * (10 * 1024)
+
+        def close(self):
+            return None
+
+    class _FakeCurlSession:
+        def __init__(self, **_kwargs):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return _FakeCurlResponse()
+
+    def _fake_time():
+        return fake_clock[0]
+
+    def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        fake_clock[0] += seconds
+
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+    monkeypatch.setattr(run.time, "time", _fake_time)
+    monkeypatch.setattr(run.time, "sleep", _fake_sleep)
+
+    client = run.GoFile()
+    output_path = tmp_path / "curl" / "slow.bin"
+    ok = client.download(
+        "https://cdn.example/file",
+        str(output_path),
+        chunk_size=10 * 1024,
+        retry_attempts=0,
+    )
+
+    assert ok is True
+    assert 3 in sleep_calls
+
+
+def test_download_low_speed_guard_applies_even_with_low_throttle(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    fake_clock = [0.0]
+    sleep_calls = []
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {"Content-Length": str(11 * 10 * 1024)}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            for _ in range(11):
+                fake_clock[0] += 1.0
+                yield b"x" * (10 * 1024)
+
+        def close(self):
+            return None
+
+    class _FakeCurlSession:
+        def __init__(self, **_kwargs):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return _FakeCurlResponse()
+
+    def _fake_time():
+        return fake_clock[0]
+
+    def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        fake_clock[0] += seconds
+
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+    monkeypatch.setattr(run.time, "time", _fake_time)
+    monkeypatch.setattr(run.time, "sleep", _fake_sleep)
+
+    client = run.GoFile()
+    output_path = tmp_path / "curl" / "slow-throttled.bin"
+    ok = client.download(
+        "https://cdn.example/file",
+        str(output_path),
+        chunk_size=10 * 1024,
+        throttle_speed=80,
+        retry_attempts=0,
+    )
+
+    assert ok is True
+    assert 3 in sleep_calls
+
+
+def test_execute_reuses_existing_nested_folder_in_incremental_mode(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.token = "token-123"
+    client.wt = "wt-123"
+
+    root_path = tmp_path / "Root"
+    renamed_nested_path = root_path / "Nested Renamed"
+    renamed_nested_path.mkdir(parents=True, exist_ok=True)
+
+    class _FakeTracker:
+        def find_existing_folder(self, folder_name, parent_dir):
+            if folder_name == "Nested" and parent_dir == str(root_path):
+                return str(renamed_nested_path)
+            return None
+
+        def is_downloaded(self, _file_id, _file_name):
+            return False
+
+        def mark_downloaded(self, _file_id, _file_name):
+            return None
+
+    tracker = _FakeTracker()
+
+    class _FakeMetaTransport:
+        def request_json(self, method, url, headers=None, params=None, timeout=10, credentials="include"):
+            del method, headers, params, timeout, credentials
+            content_id = url.rsplit("/", 1)[-1]
+            if content_id == "root-folder":
+                return {
+                    "status": "ok",
+                    "data": {
+                        "type": "folder",
+                        "name": "Root",
+                        "children": {
+                            "nested-folder": {
+                                "type": "folder",
+                                "name": "Nested",
+                            }
+                        },
+                    },
+                }
+
+            if content_id == "nested-folder":
+                return {
+                    "status": "ok",
+                    "data": {
+                        "type": "folder",
+                        "name": "Nested",
+                        "children": {
+                            "file-1": {
+                                "type": "file",
+                                "name": "A.bin",
+                                "link": "https://cdn.example/a",
+                            }
+                        },
+                    },
+                }
+
+            raise AssertionError(f"unexpected content id {content_id}")
+
+        def request_text(self, method, url, headers=None, params=None, timeout=10, credentials="include"):
+            del method, url, headers, params, timeout, credentials
+            return 'appdata.wt = "wt-123"'
+
+    client.meta_transport = _FakeMetaTransport()
+
+    downloaded_paths = []
+
+    def _fake_download(_link=None, _file=None, **_kwargs):
+        if _file is None:
+            _file = _kwargs.get("file")
+        assert _file
+        downloaded_paths.append(_file)
+        return True
+
+    monkeypatch.setattr(client, "download", _fake_download)
+
+    client.execute(
+        dir=str(tmp_path),
+        content_id="root-folder",
+        incremental=True,
+        tracker=cast(run.DownloadTracker, tracker),
+    )
+
+    assert downloaded_paths == [
+        os.path.join(str(renamed_nested_path), "A.bin"),
+    ]
+
+
+def test_download_handles_missing_content_length_without_division_by_zero(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            yield b"hello"
+
+        def close(self):
+            return None
+
+    class _FakeCurlSession:
+        def __init__(self, **_kwargs):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return _FakeCurlResponse()
+
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+
+    client = run.GoFile()
+    output_path = tmp_path / "curl" / "no-content-length.bin"
+    observed_progress = []
+
+    ok = client.download(
+        "https://cdn.example/file",
+        str(output_path),
+        progress_callback=lambda pct: observed_progress.append(pct),
+        retry_attempts=0,
+    )
+
+    assert ok is True
+    assert observed_progress
+    assert output_path.read_bytes() == b"hello"
