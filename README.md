@@ -71,6 +71,34 @@ This application has been updated to work with GoFile's latest API changes:
 
 ## Quick Start
 
+### CLI (Single URL + Batch URL Input)
+
+```bash
+# Single URL
+python run.py "https://gofile.io/d/abc123" -d "./output"
+
+# Batch mode (no url arg):
+# 1) paste one URL per line
+# 2) press Enter twice to start
+python run.py -d "./output"
+```
+
+Batch mode behavior:
+
+- Each line is `trim`-processed
+- Empty lines are ignored
+- Invalid lines are skipped automatically
+- Download starts immediately after two consecutive blank lines (double Enter)
+
+Credential cache behavior (for lower GoFile account creation pressure):
+
+- Guest account token and website token are persisted in `.gofile_api_cache.json`
+- Cache location: `${CONFIG_DIR}` if set, otherwise `~/.cache/gofile-dl`
+- Force refresh both values with `--refresh-auth`
+- Optional TTL env vars:
+  - `GOFILE_TOKEN_CACHE_TTL` (default `43200` seconds)
+  - `GOFILE_WT_CACHE_TTL` (default `3600` seconds)
+
 ### Using Docker (Recommended)
 
 ## Docker Deployment Guide

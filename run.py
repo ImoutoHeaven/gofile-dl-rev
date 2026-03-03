@@ -7,7 +7,7 @@ import hashlib
 import time
 import re
 import json
-from typing import Dict, Any, Optional, Callable, Set
+from typing import Dict, Any, Optional, Callable, Set, List, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,6 +17,79 @@ logging.basicConfig(
 logger = logging.getLogger("GoFile")
 
 DEFAULT_TIMEOUT = 10  # 10 seconds
+GOFILE_URL_PATTERN = re.compile(r"^https?://gofile\.io/d/([A-Za-z0-9]+)(?:/)?$")
+DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
+DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
+
+
+def get_runtime_config_dir() -> str:
+    """Return writable config directory for cache/tracker data."""
+    config_dir = os.environ.get("CONFIG_DIR")
+    if config_dir:
+        return config_dir
+    return os.path.join(os.path.expanduser("~"), ".cache", "gofile-dl")
+
+
+def normalize_gofile_url(raw_url: str) -> Optional[str]:
+    """Validate and normalize a GoFile URL to canonical form."""
+    cleaned = raw_url.strip()
+    if not cleaned:
+        return None
+
+    match = GOFILE_URL_PATTERN.fullmatch(cleaned)
+    if not match:
+        return None
+
+    content_id = match.group(1)
+    return f"https://gofile.io/d/{content_id}"
+
+
+def filter_gofile_urls(raw_lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Trim, validate, and split URL lines into valid and invalid lists."""
+    valid_urls: List[str] = []
+    invalid_lines: List[str] = []
+
+    for raw_line in raw_lines:
+        cleaned = raw_line.strip()
+        if not cleaned:
+            continue
+
+        normalized = normalize_gofile_url(cleaned)
+        if normalized is None:
+            invalid_lines.append(cleaned)
+            continue
+
+        valid_urls.append(normalized)
+
+    return valid_urls, invalid_lines
+
+
+def collect_batch_urls(input_fn: Callable[[str], str] = input) -> List[str]:
+    """
+    Collect URL lines from stdin and stop on two consecutive blank lines.
+
+    A single blank line is ignored to let users separate URL groups visually.
+    """
+    collected: List[str] = []
+    blank_streak = 0
+
+    while True:
+        try:
+            line = input_fn("")
+        except EOFError:
+            break
+
+        cleaned = line.strip()
+        if not cleaned:
+            blank_streak += 1
+            if blank_streak >= 2:
+                break
+            continue
+
+        blank_streak = 0
+        collected.append(cleaned)
+
+    return collected
 
 def strip_emojis_func(text: str) -> str:
     """
@@ -222,9 +295,81 @@ class GoFile(metaclass=GoFileMeta):
     """
     
     def __init__(self) -> None:
-        """Initialize the GoFile client with empty token and wt."""
+        """Initialize the GoFile client and credential cache settings."""
         self.token: str = ""
         self.wt: str = ""
+        self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
+        self.wt_cache_ttl = self._read_ttl_env("GOFILE_WT_CACHE_TTL", DEFAULT_WT_CACHE_TTL)
+        self.cache_file = os.path.join(get_runtime_config_dir(), ".gofile_api_cache.json")
+        self._cache_loaded = False
+
+    @staticmethod
+    def _read_ttl_env(env_name: str, default_value: int) -> int:
+        """Read cache TTL from environment with safe fallback."""
+        raw_value = os.environ.get(env_name)
+        if raw_value is None:
+            return default_value
+        try:
+            ttl = int(raw_value)
+        except ValueError:
+            logger.warning(f"Invalid {env_name} value '{raw_value}', using default {default_value}")
+            return default_value
+        return max(ttl, 0)
+
+    def _load_credential_cache(self) -> None:
+        """Load cached account token and website token when still fresh."""
+        if self._cache_loaded:
+            return
+
+        self._cache_loaded = True
+        try:
+            with open(self.cache_file, "r") as cache_fp:
+                cache_data = json.load(cache_fp)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+
+        now = time.time()
+        token_data = cache_data.get("token", {})
+        cached_token = token_data.get("value", "")
+        token_updated_at = token_data.get("updated_at", 0)
+        if cached_token and now - token_updated_at <= self.token_cache_ttl:
+            self.token = cached_token
+
+        wt_data = cache_data.get("wt", {})
+        cached_wt = wt_data.get("value", "")
+        wt_updated_at = wt_data.get("updated_at", 0)
+        if cached_wt and now - wt_updated_at <= self.wt_cache_ttl:
+            self.wt = cached_wt
+
+    def _save_credential_cache(self, token_updated: bool = False, wt_updated: bool = False) -> None:
+        """Persist token/wt cache with timestamp for TTL-based refresh."""
+        if not token_updated and not wt_updated:
+            return
+
+        cache_data: Dict[str, Dict[str, Any]] = {}
+        try:
+            with open(self.cache_file, "r") as cache_fp:
+                cache_data = json.load(cache_fp)
+                if not isinstance(cache_data, dict):
+                    cache_data = {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            cache_data = {}
+
+        now = time.time()
+        if token_updated and self.token:
+            cache_data["token"] = {"value": self.token, "updated_at": now}
+        if wt_updated and self.wt:
+            cache_data["wt"] = {"value": self.wt, "updated_at": now}
+
+        cache_dir = os.path.dirname(self.cache_file)
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            temp_path = self.cache_file + ".tmp"
+            with open(temp_path, "w") as cache_fp:
+                json.dump(cache_data, cache_fp, indent=2)
+            os.replace(temp_path, self.cache_file)
+        except OSError as cache_error:
+            logger.warning(f"Could not persist credential cache: {cache_error}")
     
     def count_files(self, children: Dict[str, Dict]) -> int:
         """
@@ -246,36 +391,65 @@ class GoFile(metaclass=GoFileMeta):
             count += 1
         return count
     
-    def update_token(self) -> None:
+    def update_token(self, force_refresh: bool = False) -> None:
         """
         Update the access token used for API requests.
         
         Makes a request to GoFile's accounts API to get a fresh token.
         """
-        if self.token == "":
+        if force_refresh:
+            self.token = ""
+        else:
+            if self.token:
+                return
+            self._load_credential_cache()
+            if self.token:
+                return
+
+        try:
             data = requests.post("https://api.gofile.io/accounts", timeout=DEFAULT_TIMEOUT).json()
-            if data.get("status") == "ok":
-                self.token = data["data"].get("token", "")
-                logger.info(f"Updated token: {self.token}")
+        except Exception as e:
+            logger.error(f"Cannot get token: {e}")
+            return
+
+        if data.get("status") == "ok":
+            self.token = data["data"].get("token", "")
+            if self.token:
+                self._save_credential_cache(token_updated=True)
+                logger.info("Updated token")
             else:
-                logger.error("Cannot get token")
+                logger.error("Token response did not contain token value")
+        else:
+            logger.error("Cannot get token")
     
-    def update_wt(self) -> None:
+    def update_wt(self, force_refresh: bool = False) -> None:
         """
         Update the 'wt' (websiteToken) parameter needed for content requests.
         
         Extracts the wt parameter from GoFile's config.js JavaScript file.
         """
-        if self.wt == "":
-            try:
-                alljs = requests.get("https://gofile.io/dist/js/config.js", timeout=DEFAULT_TIMEOUT).text
-                if 'appdata.wt = "' in alljs:
-                    self.wt = alljs.split('appdata.wt = "')[1].split('"')[0]
-                    logger.info(f"Updated wt: {self.wt}")
+        if force_refresh:
+            self.wt = ""
+        else:
+            if self.wt:
+                return
+            self._load_credential_cache()
+            if self.wt:
+                return
+
+        try:
+            alljs = requests.get("https://gofile.io/dist/js/config.js", timeout=DEFAULT_TIMEOUT).text
+            if 'appdata.wt = "' in alljs:
+                self.wt = alljs.split('appdata.wt = "')[1].split('"')[0]
+                if self.wt:
+                    self._save_credential_cache(wt_updated=True)
+                    logger.info("Updated wt")
                 else:
-                    logger.error("Cannot extract wt from config.js")
-            except Exception as e:
-                logger.error(f"Failed to get wt: {e}")
+                    logger.error("wt extraction produced an empty value")
+            else:
+                logger.error("Cannot extract wt from config.js")
+        except Exception as e:
+            logger.error(f"Failed to get wt: {e}")
     
     def execute(self, 
                 dir: str, 
@@ -287,14 +461,15 @@ class GoFile(metaclass=GoFileMeta):
                 name_callback: Optional[Callable[[str], None]] = None,
                 overall_progress_callback: Optional[Callable[[int, str], None]] = None, 
                 start_time: Optional[float] = None,
-                file_progress_callback: Optional[Callable[[str, int, Optional[int]], None]] = None, 
+                file_progress_callback: Optional[Callable[..., None]] = None,
                 pause_callback: Optional[Callable[[], bool]] = None, 
                 throttle_speed: Optional[int] = None,
                 retry_attempts: int = 0,
                 strip_emojis: bool = False,
                 incremental: bool = False,
                 tracker: Optional[DownloadTracker] = None,
-                folder_pattern: Optional[str] = None) -> None:
+                folder_pattern: Optional[str] = None,
+                auth_retry: bool = True) -> None:
         """
         Execute a download operation for a GoFile URL or content ID.
         
@@ -319,6 +494,7 @@ class GoFile(metaclass=GoFileMeta):
             incremental: Enable incremental mode (skip already downloaded files)
             tracker: Download tracker instance (created automatically if None)
             folder_pattern: Custom patterns to strip from folder names (pipe-separated)
+            auth_retry: Retry once after forcing token/wt refresh when API auth fails
         """
         if content_id is not None:
             self.update_token()
@@ -349,6 +525,31 @@ class GoFile(metaclass=GoFileMeta):
                 logger.error(f"Failed to fetch content {content_id}: {e}")
                 return
             if data.get("status") != "ok":
+                if auth_retry:
+                    logger.warning("API error, forcing credential refresh and retrying once")
+                    self.update_token(force_refresh=True)
+                    self.update_wt(force_refresh=True)
+                    self.execute(
+                        dir=dir,
+                        content_id=content_id,
+                        password=password,
+                        progress_callback=progress_callback,
+                        cancel_event=cancel_event,
+                        name_callback=name_callback,
+                        overall_progress_callback=overall_progress_callback,
+                        start_time=start_time,
+                        file_progress_callback=file_progress_callback,
+                        pause_callback=pause_callback,
+                        throttle_speed=throttle_speed,
+                        retry_attempts=retry_attempts,
+                        strip_emojis=strip_emojis,
+                        incremental=incremental,
+                        tracker=tracker,
+                        folder_pattern=folder_pattern,
+                        auth_retry=False,
+                    )
+                    return
+
                 logger.error("API error: %s", data)
                 return
             if data["data"].get("passwordStatus", "passwordOk") != "passwordOk":
@@ -437,7 +638,8 @@ class GoFile(metaclass=GoFileMeta):
                                 strip_emojis=strip_emojis,
                                 incremental=incremental,
                                 tracker=tracker,
-                                folder_pattern=folder_pattern
+                                folder_pattern=folder_pattern,
+                                auth_retry=auth_retry,
                             )
                             files_completed += 1.0  # Count the folder as processed
                             
@@ -534,14 +736,31 @@ class GoFile(metaclass=GoFileMeta):
                 if callable(file_progress_callback):
                     file_progress_callback(file_path, 100)
         elif url is not None:
-            if url.startswith("https://gofile.io/d/"):
-                cid = url.split("/")[-1]
-                self.execute(dir=dir, content_id=cid, password=password,
-                             progress_callback=progress_callback, cancel_event=cancel_event,
-                             name_callback=name_callback, overall_progress_callback=overall_progress_callback,
-                             start_time=start_time, file_progress_callback=file_progress_callback, pause_callback=pause_callback, throttle_speed=throttle_speed, retry_attempts=retry_attempts, strip_emojis=strip_emojis, incremental=incremental, tracker=tracker, folder_pattern=folder_pattern)
-            else:
+            normalized_url = normalize_gofile_url(url)
+            if normalized_url is None:
                 logger.error(f"Invalid URL: {url}")
+                return
+
+            cid = normalized_url.split("/")[-1]
+            self.execute(
+                dir=dir,
+                content_id=cid,
+                password=password,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                name_callback=name_callback,
+                overall_progress_callback=overall_progress_callback,
+                start_time=start_time,
+                file_progress_callback=file_progress_callback,
+                pause_callback=pause_callback,
+                throttle_speed=throttle_speed,
+                retry_attempts=retry_attempts,
+                strip_emojis=strip_emojis,
+                incremental=incremental,
+                tracker=tracker,
+                folder_pattern=folder_pattern,
+                auth_retry=auth_retry,
+            )
         else:
             logger.error("Invalid parameters")
     
@@ -551,7 +770,7 @@ class GoFile(metaclass=GoFileMeta):
                 chunk_size: int = 8192, 
                 progress_callback: Optional[Callable[[int], None]] = None,
                 cancel_event: Optional[Any] = None, 
-                file_progress_callback: Optional[Callable[[str, int, Optional[int]], None]] = None, 
+                file_progress_callback: Optional[Callable[..., None]] = None,
                 pause_callback: Optional[Callable[[], bool]] = None, 
                 throttle_speed: Optional[int] = None,
                 retry_attempts: int = 0, 
@@ -664,22 +883,67 @@ class GoFile(metaclass=GoFileMeta):
                         file_progress_callback(file, -2)  # -2 indicates permanent failure
                     break
 
-def main() -> None:
+def main(
+    argv: Optional[List[str]] = None,
+    input_fn: Callable[[str], str] = input,
+    gofile_factory: Callable[[], Any] = GoFile,
+) -> int:
     """
     Main function for CLI usage.
     
     Parses command line arguments and initiates download.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("url")
+    parser.add_argument("url", nargs="?")
     parser.add_argument("-d", type=str, dest="dir", help="output directory")
     parser.add_argument("-p", type=str, dest="password", help="password")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--refresh-auth",
+        action="store_true",
+        help="force refresh account token and website token before download",
+    )
+    args = parser.parse_args(argv)
+
     out_dir = args.dir if args.dir is not None else "./output"
-    GoFile().execute(dir=out_dir, url=args.url, password=args.password,
-                      progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
-                      overall_progress_callback=lambda p, eta: logger.info(f"Overall progress: {p}% | ETA: {eta}"),
-                      name_callback=lambda name: logger.info(f"Task name set to: {name}"),
-                      file_progress_callback=lambda f, p: logger.info(f"File {f} progress: {p}%"))
+
+    if args.url:
+        raw_urls = [args.url]
+    else:
+        logger.info("Batch mode: enter one URL per line, then press Enter twice to start")
+        raw_urls = collect_batch_urls(input_fn=input_fn)
+
+    urls, invalid_lines = filter_gofile_urls(raw_urls)
+    if invalid_lines:
+        logger.warning(f"Skipped {len(invalid_lines)} invalid URL line(s)")
+
+    if not urls:
+        logger.error("No valid GoFile URLs provided")
+        return 1
+
+    gofile_client = gofile_factory()
+    if args.refresh_auth:
+        if hasattr(gofile_client, "update_token"):
+            gofile_client.update_token(force_refresh=True)
+        if hasattr(gofile_client, "update_wt"):
+            gofile_client.update_wt(force_refresh=True)
+
+    for index, url in enumerate(urls, start=1):
+        logger.info(f"Starting download {index}/{len(urls)}: {url}")
+        gofile_client.execute(
+            dir=out_dir,
+            url=url,
+            password=args.password,
+            progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
+            overall_progress_callback=lambda p, eta: logger.info(
+                f"Overall progress: {p}% | ETA: {eta}"
+            ),
+            name_callback=lambda name: logger.info(f"Task name set to: {name}"),
+            file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
+                f"File {f} progress: {p}%"
+            ),
+        )
+
+    return 0
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
