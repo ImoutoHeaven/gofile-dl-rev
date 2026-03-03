@@ -104,6 +104,9 @@ python run.py -pb -d "./output"
 # Payload bundle mode from direct argument
 python run.py --payload-bundle "BASE64_OR_JSON_BUNDLE" -d "./output"
 
+# Payload bundle mode from file path
+python run.py -pb ./bundle.txt -d "./output"
+
 # Auto-retry unresolved failures through payload mode (default is 3)
 python run.py --total-retries 3 -d "./output"
 
@@ -125,6 +128,7 @@ Payload mode behavior:
 - Useful when `/contents` endpoint is rate-limited from your current IP
 - Supports single JSON object, JSON object array, JSON Lines, or whitespace-delimited JSON objects (for example, pretty JSON blocks separated by blank lines)
 - Supports payload bundles (`-pb` / `--payload-bundle`): if trimmed input starts with `{`, parse as JSON; otherwise decode as base64/base64url JSON
+- `-pb` accepts direct text, file path, or `-` (read bundle from stdin)
 - Bundle format supports `accountToken` + `payloads` / `payload` / `payloadJsonl`; when `--account-token` is not provided, CLI reuses `accountToken` from bundle
 - Automatically skips already-downloaded files when payload metadata matches (`size`/`md5`)
 - Failed downloads are written to `failed_files.json` in the output directory

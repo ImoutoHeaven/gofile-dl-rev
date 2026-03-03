@@ -304,6 +304,48 @@ def test_main_payload_bundle_prompt_mode_parses_double_blank_terminated_input(tm
     ]
 
 
+def test_main_payload_bundle_file_path_reads_bundle_text(tmp_path):
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "link": "https://cdn.example/a",
+        },
+    }
+    bundle = {
+        "schema": "gofile-payload-bundle/v1",
+        "accountToken": "data.token=bundle-token",
+        "payloads": [payload],
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(bundle).encode("utf-8")).decode("ascii").rstrip("=")
+    bundle_file = tmp_path / "bundle.txt"
+    bundle_file.write_text(encoded, encoding="utf-8")
+
+    calls = []
+
+    class FakeGoFile:
+        def __init__(self):
+            self.token = ""
+
+        def download(self, link, file, **_kwargs):
+            calls.append((link, file, self.token))
+
+    exit_code = run.main(
+        argv=["-pb", str(bundle_file), "-d", str(tmp_path)],
+        gofile_factory=FakeGoFile,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        (
+            "https://cdn.example/a",
+            os.path.join(str(tmp_path), "A.txt"),
+            "bundle-token",
+        )
+    ]
+
+
 def test_main_payload_mode_downloads_multiple_payloads_from_jsonl(tmp_path):
     payload_file = tmp_path / "payloads.jsonl"
     payload_file.write_text(

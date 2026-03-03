@@ -390,8 +390,31 @@ def read_payload_bundle_input(
     payload_bundle_arg: str,
     input_fn: Callable[[str], str] = input,
 ) -> str:
-    """Resolve payload-bundle arg as direct text or interactive paste block."""
+    """Resolve payload-bundle arg as direct text, file path, stdin, or interactive paste block."""
     if payload_bundle_arg != PAYLOAD_BUNDLE_PROMPT_SENTINEL:
+        candidate = payload_bundle_arg.strip()
+        if not candidate:
+            raise ValueError("Payload bundle input is empty")
+
+        if candidate == "-":
+            raw_stdin_bundle = sys.stdin.read()
+            if not raw_stdin_bundle.strip():
+                raise ValueError("Payload bundle input from stdin is empty")
+            return raw_stdin_bundle
+
+        expanded_path = os.path.expanduser(candidate)
+        if os.path.isfile(expanded_path):
+            try:
+                with open(expanded_path, "r", encoding="utf-8") as bundle_fp:
+                    raw_file_bundle = bundle_fp.read()
+            except OSError as e:
+                raise ValueError(f"Cannot read payload bundle file '{candidate}': {e}") from e
+
+            if not raw_file_bundle.strip():
+                raise ValueError(f"Payload bundle file '{candidate}' is empty")
+
+            return raw_file_bundle
+
         return payload_bundle_arg
 
     logger.info("Payload-bundle mode: paste JSON/base64 bundle, then press Enter twice to finish")
