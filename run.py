@@ -889,12 +889,22 @@ class GoFile(metaclass=GoFileMeta):
         self.token: str = ""
         self.wt: str = ""
         self.meta_transport = build_meta_transport()
+        self._download_session: Optional[Any] = None
         self.failed_files: List[Dict[str, Any]] = []
         self.failed_report_dir: Optional[str] = None
         self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
         self.wt_cache_ttl = self._read_ttl_env("GOFILE_WT_CACHE_TTL", DEFAULT_WT_CACHE_TTL)
         self.cache_file = os.path.join(get_runtime_config_dir(), ".gofile_api_cache.json")
         self._cache_loaded = False
+
+    def _get_download_session(self) -> Any:
+        """Reuse one curl_cffi session with browser impersonation for all file transfers."""
+        if self._download_session is None:
+            self._download_session = curl_requests.Session(
+                impersonate="chrome",
+                default_headers=True,
+            )
+        return self._download_session
 
     def clear_failed_files(self) -> None:
         """Reset in-memory failed download records for a new run."""
@@ -1578,12 +1588,16 @@ class GoFile(metaclass=GoFileMeta):
                 file_dir = os.path.dirname(file)
                 os.makedirs(file_dir, exist_ok=True)
                 size = os.path.getsize(temp) if os.path.exists(temp) else 0
-                response = curl_requests.get(
-                    link, headers={
-                        "Cookie": f"accountToken={self.token}",
-                        "Range": f"bytes={size}-"
-                    }, stream=True, timeout=DEFAULT_TIMEOUT
-                )
+                request_headers = {"Range": f"bytes={size}-"}
+                request_kwargs: Dict[str, Any] = {
+                    "headers": request_headers,
+                    "stream": True,
+                    "timeout": DEFAULT_TIMEOUT,
+                }
+                if self.token:
+                    request_kwargs["cookies"] = {"accountToken": self.token}
+
+                response = self._get_download_session().get(link, **request_kwargs)
                 try:
                     response.raise_for_status()
                     total_size = int(response.headers.get("Content-Length", 0)) + size

@@ -403,7 +403,8 @@ def test_execute_payload_flushes_failed_report_immediately(monkeypatch, tmp_path
 
 def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
     run.GoFileMeta._instances.clear()
-    client = run.GoFile()
+    observed_session_kwargs = {}
+    observed_get_kwargs = {}
 
     class _FakeCurlResponse:
         def __init__(self):
@@ -420,14 +421,28 @@ def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
         def close(self):
             self.closed = True
 
+    class _FakeCurlSession:
+        def __init__(self, **kwargs):
+            observed_session_kwargs.update(kwargs)
+
+        def get(self, *_args, **kwargs):
+            observed_get_kwargs.update(kwargs)
+            return _FakeCurlResponse()
+
     def _requests_get_should_not_run(*_args, **_kwargs):
         raise AssertionError("requests.get download path should not be used")
 
     monkeypatch.setattr(run.requests, "get", _requests_get_should_not_run)
-    monkeypatch.setattr(run.curl_requests, "get", lambda *_args, **_kwargs: _FakeCurlResponse())
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+
+    client = run.GoFile()
+    client.token = "token-123"
 
     output_path = tmp_path / "curl" / "ok.bin"
     ok = client.download("https://cdn.example/file", str(output_path), retry_attempts=0)
 
     assert ok is True
+    assert observed_session_kwargs.get("impersonate") == "chrome"
+    assert observed_get_kwargs.get("impersonate") is None
+    assert observed_get_kwargs.get("cookies") == {"accountToken": "token-123"}
     assert output_path.read_bytes() == b"hello"
