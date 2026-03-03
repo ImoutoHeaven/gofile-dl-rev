@@ -18,6 +18,7 @@ logger = logging.getLogger("GoFile")
 
 DEFAULT_TIMEOUT = 10  # 10 seconds
 GOFILE_URL_PATTERN = re.compile(r"^https?://gofile\.io/d/([A-Za-z0-9]+)(?:/)?$")
+ACCOUNT_TOKEN_PATTERN = re.compile(r"data\.token\s*[:=]\s*['\"]?([^'\"\s,}]+)")
 DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
 DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
 
@@ -42,6 +43,31 @@ def normalize_gofile_url(raw_url: str) -> Optional[str]:
 
     content_id = match.group(1)
     return f"https://gofile.io/d/{content_id}"
+
+
+def extract_account_token(raw_token: str) -> Optional[str]:
+    """Extract account token from plain text, data.token assignment, or JSON payload."""
+    cleaned = raw_token.strip()
+    if not cleaned:
+        return None
+
+    match = ACCOUNT_TOKEN_PATTERN.search(cleaned)
+    if match:
+        return match.group(1)
+
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return cleaned
+
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            token = data.get("token")
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+
+    return cleaned
 
 
 def filter_gofile_urls(raw_lines: List[str]) -> Tuple[List[str], List[str]]:
@@ -898,6 +924,12 @@ def main(
     parser.add_argument("-d", type=str, dest="dir", help="output directory")
     parser.add_argument("-p", type=str, dest="password", help="password")
     parser.add_argument(
+        "--account-token",
+        type=str,
+        dest="account_token",
+        help="reuse an existing account token; supports raw token or data.token=...",
+    )
+    parser.add_argument(
         "--refresh-auth",
         action="store_true",
         help="force refresh account token and website token before download",
@@ -921,11 +953,20 @@ def main(
         return 1
 
     gofile_client = gofile_factory()
+    manual_account_token = None
+    if args.account_token:
+        manual_account_token = extract_account_token(args.account_token)
+
     if args.refresh_auth:
-        if hasattr(gofile_client, "update_token"):
+        if hasattr(gofile_client, "update_token") and manual_account_token is None:
             gofile_client.update_token(force_refresh=True)
         if hasattr(gofile_client, "update_wt"):
             gofile_client.update_wt(force_refresh=True)
+
+    if manual_account_token is not None and hasattr(gofile_client, "token"):
+        gofile_client.token = manual_account_token
+        if hasattr(gofile_client, "_save_credential_cache"):
+            gofile_client._save_credential_cache(token_updated=True)
 
     for index, url in enumerate(urls, start=1):
         logger.info(f"Starting download {index}/{len(urls)}: {url}")

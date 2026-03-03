@@ -81,6 +81,9 @@ python run.py "https://gofile.io/d/abc123" -d "./output"
 # 1) paste one URL per line
 # 2) press Enter twice to start
 python run.py -d "./output"
+
+# Reuse an existing account token (supports raw token or data.token=...)
+python run.py --account-token "data.token=YOUR_TOKEN" -d "./output"
 ```
 
 Batch mode behavior:
@@ -94,6 +97,7 @@ Credential cache behavior (for lower GoFile account creation pressure):
 
 - Guest account token and website token are persisted in `.gofile_api_cache.json`
 - Cache location: `${CONFIG_DIR}` if set, otherwise `~/.cache/gofile-dl`
+- Reuse your own token with `--account-token` (you can paste raw token or `data.token=...`)
 - Force refresh both values with `--refresh-auth`
 - Optional TTL env vars:
   - `GOFILE_TOKEN_CACHE_TTL` (default `43200` seconds)
