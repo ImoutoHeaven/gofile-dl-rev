@@ -126,6 +126,7 @@ Payload mode behavior:
 Metadata transport behavior:
 
 - GoFile metadata requests (`/accounts`, `/dist/js/config.js`, `/contents/{id}`) run through persistent headless Chromium.
+- First-time setup requires browser binaries: run `playwright install chromium` after installing dependencies.
 - Browser session/profile state is stored at `${CONFIG_DIR}/.gofile-chrome-profile` (or `~/.cache/gofile-dl/.gofile-chrome-profile` when `CONFIG_DIR` is unset).
 - Direct file transfer links continue using `curl_cffi`.
 

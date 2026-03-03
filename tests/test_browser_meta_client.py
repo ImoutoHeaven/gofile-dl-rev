@@ -114,42 +114,51 @@ def test_request_text_warms_gofile_origin_before_first_fetch(tmp_path, monkeypat
     assert call_order[1][0] == "fetch"
 
 
-def test_ensure_driver_falls_back_to_selenium_when_uc_missing(tmp_path, monkeypatch):
+def test_ensure_driver_uses_playwright_persistent_context(tmp_path, monkeypatch):
     transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
-    captured = {"args": []}
+    captured = {"launch": {}, "init_scripts": []}
 
-    class _FakeOptions:
-        def __init__(self):
-            self.arguments = []
-
-        def add_argument(self, value):
-            self.arguments.append(value)
-
-    class _FakeChromeDriver:
-        def get(self, _url):
+    class _FakePage:
+        def goto(self, _url):
             return None
 
-        def get_cookies(self):
-            return []
-
-        def execute_script(self, _script):
+        def evaluate(self, _script):
             return {"localStorage": {}, "sessionStorage": {}}
 
-        def quit(self):
+    class _FakeContext:
+        def __init__(self):
+            self.pages = [_FakePage()]
+
+        def cookies(self, _url):
+            return []
+
+        def add_init_script(self, script):
+            captured["init_scripts"].append(script)
+
+        def close(self):
             return None
 
-    def _fake_chrome(options=None):
-        assert options is not None
-        captured["args"] = list(options.arguments)
-        return _FakeChromeDriver()
+    class _FakePlaywright:
+        def __init__(self):
+            self.chromium = types.SimpleNamespace(launch_persistent_context=self._launch)
+
+        def _launch(self, **kwargs):
+            captured["launch"].update(kwargs)
+            return _FakeContext()
+
+        def stop(self):
+            return None
+
+    class _FakeSyncPlaywrightFactory:
+        def start(self):
+            return _FakePlaywright()
+
+    def _fake_sync_playwright():
+        return _FakeSyncPlaywrightFactory()
 
     def _fake_import_module(name):
-        if name == "undetected_chromedriver":
-            raise ImportError("uc missing")
-        if name == "selenium.webdriver":
-            return types.SimpleNamespace(Chrome=_fake_chrome)
-        if name == "selenium.webdriver.chrome.options":
-            return types.SimpleNamespace(Options=_FakeOptions)
+        if name == "playwright.sync_api":
+            return types.SimpleNamespace(sync_playwright=_fake_sync_playwright)
         raise AssertionError(f"unexpected import: {name}")
 
     monkeypatch.setattr(gbc.importlib, "import_module", _fake_import_module)
@@ -157,54 +166,69 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_missing(tmp_path, monkeypa
     transport._ensure_driver()
 
     assert transport._driver is not None
-    assert "--headless=new" in captured["args"]
-    assert f"--user-data-dir={tmp_path}" in captured["args"]
+    launch = captured["launch"]
+    assert launch["user_data_dir"] == str(tmp_path)
+    assert launch["headless"] is True
+    assert launch["user_agent"].startswith("Mozilla/5.0")
+    assert launch["locale"] == "en-US"
+    assert launch["timezone_id"] == "UTC"
+    assert launch["viewport"] == {"width": 1366, "height": 768}
+    assert launch["extra_http_headers"]["Accept-Language"] == "en-US,en;q=0.9"
+    assert launch["extra_http_headers"]["DNT"] == "1"
+    assert "--headless=new" in launch["args"]
+    assert "--disable-blink-features=AutomationControlled" in launch["args"]
+    assert captured["init_scripts"]
+    assert "'webdriver'" in captured["init_scripts"][0]
 
 
-def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, monkeypatch):
+def test_ensure_driver_creates_new_page_when_context_has_none(tmp_path, monkeypatch):
     transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
-    events = []
+    seen = {"new_page_calls": 0}
 
-    class _FakeOptions:
-        def __init__(self):
-            self.arguments = []
-
-        def add_argument(self, value):
-            self.arguments.append(value)
-
-    class _FakeChromeDriver:
-        def get(self, _url):
+    class _FakePage:
+        def goto(self, _url):
             return None
 
-        def get_cookies(self):
-            return []
-
-        def execute_script(self, _script):
+        def evaluate(self, _script):
             return {"localStorage": {}, "sessionStorage": {}}
 
-        def quit(self):
+    class _FakeContext:
+        def __init__(self):
+            self.pages = []
+
+        def cookies(self, _url):
+            return []
+
+        def new_page(self):
+            seen["new_page_calls"] += 1
+            return _FakePage()
+
+        def add_init_script(self, _script):
             return None
 
-    def _fake_uc_chrome(options=None):
-        assert options is not None
-        events.append("uc")
-        raise RuntimeError("session not created")
+        def close(self):
+            return None
 
-    def _fake_selenium_chrome(options=None):
-        assert options is not None
-        events.append("selenium")
-        return _FakeChromeDriver()
+    class _FakePlaywright:
+        def __init__(self):
+            self.chromium = types.SimpleNamespace(launch_persistent_context=self._launch)
+
+        def _launch(self, **_kwargs):
+            return _FakeContext()
+
+        def stop(self):
+            return None
+
+    class _FakeSyncPlaywrightFactory:
+        def start(self):
+            return _FakePlaywright()
+
+    def _fake_sync_playwright():
+        return _FakeSyncPlaywrightFactory()
 
     def _fake_import_module(name):
-        if name == "undetected_chromedriver":
-            return types.SimpleNamespace(
-                ChromeOptions=_FakeOptions,
-                Chrome=_fake_uc_chrome,
-            )
-        if name == "selenium.webdriver":
-            return types.SimpleNamespace(Chrome=_fake_selenium_chrome)
-        if name == "selenium.webdriver.chrome.options":
-            return types.SimpleNamespace(Options=_FakeOptions)
+        if name == "playwright.sync_api":
+            return types.SimpleNamespace(sync_playwright=_fake_sync_playwright)
         raise AssertionError(f"unexpected import: {name}")
 
     monkeypatch.setattr(gbc.importlib, "import_module", _fake_import_module)
@@ -212,45 +236,54 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, mon
     transport._ensure_driver()
 
     assert transport._driver is not None
-    assert events == ["uc", "selenium"]
+    assert seen["new_page_calls"] == 1
 
 
 def test_ensure_driver_applies_proxy_from_env(tmp_path, monkeypatch):
     transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
-    captured = {"args": []}
+    captured = {}
 
-    class _FakeOptions:
-        def __init__(self):
-            self.arguments = []
-
-        def add_argument(self, value):
-            self.arguments.append(value)
-
-    class _FakeChromeDriver:
-        def get(self, _url):
+    class _FakePage:
+        def goto(self, _url):
             return None
 
-        def get_cookies(self):
-            return []
-
-        def execute_script(self, _script):
+        def evaluate(self, _script):
             return {"localStorage": {}, "sessionStorage": {}}
 
-        def quit(self):
+    class _FakeContext:
+        def __init__(self):
+            self.pages = [_FakePage()]
+
+        def cookies(self, _url):
+            return []
+
+        def add_init_script(self, _script):
             return None
 
-    def _fake_chrome(options=None):
-        assert options is not None
-        captured["args"] = list(options.arguments)
-        return _FakeChromeDriver()
+        def close(self):
+            return None
+
+    class _FakePlaywright:
+        def __init__(self):
+            self.chromium = types.SimpleNamespace(launch_persistent_context=self._launch)
+
+        def _launch(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeContext()
+
+        def stop(self):
+            return None
+
+    class _FakeSyncPlaywrightFactory:
+        def start(self):
+            return _FakePlaywright()
+
+    def _fake_sync_playwright():
+        return _FakeSyncPlaywrightFactory()
 
     def _fake_import_module(name):
-        if name == "undetected_chromedriver":
-            raise ImportError("uc missing")
-        if name == "selenium.webdriver":
-            return types.SimpleNamespace(Chrome=_fake_chrome)
-        if name == "selenium.webdriver.chrome.options":
-            return types.SimpleNamespace(Options=_FakeOptions)
+        if name == "playwright.sync_api":
+            return types.SimpleNamespace(sync_playwright=_fake_sync_playwright)
         raise AssertionError(f"unexpected import: {name}")
 
     monkeypatch.setenv("GOFILE_PROXY", "http://127.0.0.1:7890")
@@ -258,7 +291,7 @@ def test_ensure_driver_applies_proxy_from_env(tmp_path, monkeypatch):
 
     transport._ensure_driver()
 
-    assert "--proxy-server=http://127.0.0.1:7890" in captured["args"]
+    assert captured["proxy"] == {"server": "http://127.0.0.1:7890"}
 
 
 def test_ensure_driver_persists_gofile_session_state(tmp_path, monkeypatch):

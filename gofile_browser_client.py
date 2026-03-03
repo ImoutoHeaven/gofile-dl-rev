@@ -7,6 +7,64 @@ import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/145.0.0.0 Safari/537.36"
+)
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+STEALTH_INIT_SCRIPT = """
+(() => {
+  const define = (obj, key, value) => {
+    try {
+      Object.defineProperty(obj, key, {
+        configurable: true,
+        enumerable: true,
+        get: () => value,
+      });
+    } catch (_err) {}
+  };
+
+  define(navigator, 'webdriver', undefined);
+  define(navigator, 'platform', 'Win32');
+  define(navigator, 'language', 'en-US');
+  define(navigator, 'languages', ['en-US', 'en']);
+  define(navigator, 'hardwareConcurrency', 8);
+  define(navigator, 'deviceMemory', 8);
+
+  if (!window.chrome) {
+    Object.defineProperty(window, 'chrome', {
+      configurable: true,
+      enumerable: true,
+      value: { runtime: {} },
+    });
+  } else if (!window.chrome.runtime) {
+    Object.defineProperty(window.chrome, 'runtime', {
+      configurable: true,
+      enumerable: true,
+      value: {},
+    });
+  }
+
+  if (navigator.permissions && navigator.permissions.query) {
+    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (parameters) => {
+      if (parameters && parameters.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission });
+      }
+      return originalQuery(parameters);
+    };
+  }
+})();
+"""
+
+
+def _read_browser_user_agent() -> str:
+    value = os.environ.get("GOFILE_BROWSER_USER_AGENT")
+    if value and value.strip():
+        return value.strip()
+    return DEFAULT_BROWSER_USER_AGENT
+
 
 def _read_proxy_from_env() -> Optional[str]:
     for env_name in (
@@ -23,6 +81,98 @@ def _read_proxy_from_env() -> Optional[str]:
         if value and value.strip():
             return value.strip()
     return None
+
+
+class _PlaywrightDriverAdapter:
+    def __init__(self, sync_playwright: Any, profile_dir: str, proxy_server: Optional[str]) -> None:
+        self._runner = sync_playwright()
+        self._playwright = self._runner.start()
+
+        launch_kwargs: Dict[str, Any] = {
+            "user_data_dir": profile_dir,
+            "headless": True,
+            "user_agent": _read_browser_user_agent(),
+            "locale": "en-US",
+            "timezone_id": "UTC",
+            "color_scheme": "light",
+            "device_scale_factor": 1,
+            "java_script_enabled": True,
+            "viewport": {"width": 1366, "height": 768},
+            "extra_http_headers": {
+                "Accept-Language": DEFAULT_ACCEPT_LANGUAGE,
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            "args": [
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--lang=en-US,en",
+                "--window-size=1366,768",
+            ],
+        }
+        if proxy_server:
+            launch_kwargs["proxy"] = {"server": proxy_server}
+
+        self._context = self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+        self._context.add_init_script(STEALTH_INIT_SCRIPT)
+        pages = getattr(self._context, "pages", [])
+        self._page = pages[0] if pages else self._context.new_page()
+
+    def get(self, url: str) -> None:
+        self._page.goto(url)
+
+    def execute_script(self, script: str) -> Any:
+        return self._page.evaluate(f"() => {{{script}}}")
+
+    def get_cookies(self):
+        return self._context.cookies("https://gofile.io/")
+
+    def execute_async_script(self, _script: str, *args: Any) -> str:
+        if len(args) < 4:
+            raise RuntimeError("Missing fetch arguments for browser request")
+
+        url = args[0]
+        method = args[1]
+        headers = args[2]
+        timeout_ms = args[3]
+        credentials_mode = args[4] if len(args) > 4 else "include"
+
+        return self._page.evaluate(
+            """
+            async ({url, method, headers, timeoutMs, credentialsMode}) => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+                try {
+                    const resp = await fetch(url, {
+                        method: method,
+                        headers: headers || {},
+                        credentials: credentialsMode || "include",
+                        signal: controller.signal,
+                    });
+                    const text = await resp.text();
+                    return JSON.stringify({ ok: resp.ok, status: resp.status, text: text });
+                } catch (err) {
+                    return JSON.stringify({ error: String(err) });
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+            """,
+            {
+                "url": url,
+                "method": method,
+                "headers": headers,
+                "timeoutMs": timeout_ms,
+                "credentialsMode": credentials_mode,
+            },
+        )
+
+    def quit(self) -> None:
+        self._context.close()
+        self._playwright.stop()
 
 
 class BrowserMetaTransport:
@@ -105,56 +255,24 @@ class BrowserMetaTransport:
             json.dump(snapshot, state_file, indent=2, sort_keys=True)
         os.replace(temp_path, state_path)
 
-    def _configure_browser_options(self, options: Any) -> None:
-        options.add_argument("--headless=new")
-        options.add_argument(f"--user-data-dir={self.profile_dir}")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        proxy_server = _read_proxy_from_env()
-        if proxy_server:
-            options.add_argument(f"--proxy-server={proxy_server}")
-
     def _create_browser_driver(self) -> Any:
-        uc_error: Optional[Exception] = None
-
         try:
-            uc = importlib.import_module("undetected_chromedriver")
-        except ImportError:
-            uc = None
-
-        if uc is not None:
-            options = uc.ChromeOptions()
-            self._configure_browser_options(options)
-            try:
-                return uc.Chrome(options=options)
-            except Exception as exc:
-                uc_error = exc
-
-        try:
-            webdriver_module = importlib.import_module("selenium.webdriver")
-            options_module = importlib.import_module("selenium.webdriver.chrome.options")
+            playwright_module = importlib.import_module("playwright.sync_api")
         except ImportError as exc:
-            if uc_error is not None:
-                raise RuntimeError(
-                    "undetected_chromedriver failed and selenium is unavailable "
-                    "(install dependencies with `pip install -r requirements.txt`)"
-                ) from uc_error
             raise RuntimeError(
-                "BrowserMetaTransport requires undetected_chromedriver or selenium "
-                "(install dependencies with `pip install -r requirements.txt`)"
+                "BrowserMetaTransport requires playwright "
+                "(install dependencies with `pip install -r requirements.txt` and run `playwright install chromium`)"
             ) from exc
 
-        options = options_module.Options()
-        self._configure_browser_options(options)
-        try:
-            return webdriver_module.Chrome(options=options)
-        except Exception as exc:
-            if uc_error is not None:
-                raise RuntimeError(
-                    "Failed to initialize browser driver via both undetected_chromedriver "
-                    "and selenium"
-                ) from exc
-            raise
+        sync_playwright = getattr(playwright_module, "sync_playwright", None)
+        if sync_playwright is None:
+            raise RuntimeError("playwright.sync_api is missing sync_playwright")
+
+        return _PlaywrightDriverAdapter(
+            sync_playwright=sync_playwright,
+            profile_dir=self.profile_dir,
+            proxy_server=_read_proxy_from_env(),
+        )
 
     def _build_url(self, url: str, params: Optional[Dict[str, Any]]) -> str:
         if not params:
