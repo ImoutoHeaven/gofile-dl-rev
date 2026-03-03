@@ -94,6 +94,9 @@ cat payload.json | python run.py --content-payload-file - -d "./output"
 # Batch payload mode (JSON Lines: one payload JSON per line)
 python run.py --content-payload-file payloads.jsonl -d "./output"
 
+# Batch payload mode from pretty JSON blocks (separate payloads with a blank line)
+cat payloads.txt | python run.py --content-payload-file - -d "./output"
+
 # Auto-retry unresolved failures through payload mode (default is 3)
 python run.py --total-retries 3 -d "./output"
 
@@ -113,7 +116,7 @@ Payload mode behavior:
 - Accepts a raw `GET /contents/{id}` JSON response (`status=data` format)
 - Extracts direct `link` values recursively and downloads without calling `/contents` again
 - Useful when `/contents` endpoint is rate-limited from your current IP
-- Supports single JSON object, JSON object array, or JSON Lines batch input
+- Supports single JSON object, JSON object array, JSON Lines, or whitespace-delimited JSON objects (for example, pretty JSON blocks separated by blank lines)
 - Automatically skips already-downloaded files when payload metadata matches (`size`/`md5`)
 - Failed downloads are written to `failed_files.json` in the output directory
 - `failed_files.json` is payload-retry compatible (includes `type=file`, `link`, `relativePath`)

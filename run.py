@@ -210,30 +210,49 @@ def _read_payload_source(payload_source: str) -> str:
     return raw_payload
 
 
+def _decode_payload_stream(raw_payload: str) -> List[Any]:
+    """Decode multiple JSON values separated by whitespace."""
+    decoder = json.JSONDecoder()
+    payload_values: List[Any] = []
+    offset = 0
+    payload_length = len(raw_payload)
+
+    while offset < payload_length:
+        while offset < payload_length and raw_payload[offset].isspace():
+            offset += 1
+
+        if offset >= payload_length:
+            break
+
+        try:
+            value, offset = decoder.raw_decode(raw_payload, idx=offset)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "Content payload is not valid JSON payload stream "
+                f"(line {e.lineno}, column {e.colno}): {e.msg}"
+            ) from e
+
+        payload_values.append(value)
+
+    return payload_values
+
+
 def load_content_payloads(payload_source: str) -> List[Dict[str, Any]]:
     """Load one or more content payload objects from JSON/JSON array/JSONL."""
     raw_payload = _read_payload_source(payload_source)
 
     try:
         payload = json.loads(raw_payload)
-    except json.JSONDecodeError as e:
-        payloads: List[Dict[str, Any]] = []
-        for line_no, line in enumerate(raw_payload.splitlines(), start=1):
-            cleaned = line.strip()
-            if not cleaned:
-                continue
-            try:
-                line_payload = json.loads(cleaned)
-            except json.JSONDecodeError as line_error:
-                raise ValueError(
-                    f"Content payload is not valid JSON/JSONL (line {line_no}): {line_error}"
-                ) from line_error
-            if not isinstance(line_payload, dict):
-                raise ValueError(f"JSONL payload line {line_no} must be a JSON object")
-            payloads.append(line_payload)
+    except json.JSONDecodeError:
+        payload_values = _decode_payload_stream(raw_payload)
+        if not payload_values:
+            raise ValueError("Content payload source is empty")
 
-        if not payloads:
-            raise ValueError(f"Content payload is not valid JSON: {e}") from e
+        payloads: List[Dict[str, Any]] = []
+        for index, item in enumerate(payload_values, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Content payload stream item {index} must be a JSON object")
+            payloads.append(item)
 
         return payloads
 
@@ -247,7 +266,10 @@ def load_content_payloads(payload_source: str) -> List[Dict[str, Any]]:
                 raise ValueError(f"Content payload array item {index} must be a JSON object")
         return payload
 
-    raise ValueError("Content payload must be a JSON object, JSON object array, or JSONL")
+    raise ValueError(
+        "Content payload must be a JSON object, JSON object array, "
+        "or whitespace-delimited JSON objects"
+    )
 
 
 def load_content_payload(payload_source: str) -> Dict[str, Any]:

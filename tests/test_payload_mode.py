@@ -151,6 +151,37 @@ def test_load_content_payloads_supports_jsonl_file(tmp_path):
     assert payloads[1]["data"]["name"] == "B.txt"
 
 
+def test_load_content_payloads_supports_blank_line_separated_multiline_json(tmp_path):
+    payload_file = tmp_path / "payloads-multiline.json"
+    payload_file.write_text(
+        """{
+  "status": "ok",
+  "data": {
+    "type": "file",
+    "name": "A.txt",
+    "link": "https://cdn.example/a"
+  }
+}
+
+{
+  "status": "ok",
+  "data": {
+    "type": "file",
+    "name": "B.txt",
+    "link": "https://cdn.example/b"
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    payloads = run.load_content_payloads(str(payload_file))
+
+    assert len(payloads) == 2
+    assert payloads[0]["data"]["name"] == "A.txt"
+    assert payloads[1]["data"]["name"] == "B.txt"
+
+
 def test_main_payload_mode_downloads_multiple_payloads_from_jsonl(tmp_path):
     payload_file = tmp_path / "payloads.jsonl"
     payload_file.write_text(
