@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
@@ -13,6 +14,7 @@ class BrowserMetaTransport:
         self._driver: Any = None
         self._lock = threading.RLock()
         self._origin_ready = False
+        self._session_bootstrapped = False
 
     def _ensure_driver(self):
         if self._driver is not None:
@@ -21,7 +23,70 @@ class BrowserMetaTransport:
         os.makedirs(self.profile_dir, exist_ok=True)
         self._driver = self._create_browser_driver()
         self._origin_ready = False
+        self._session_bootstrapped = False
+        try:
+            self._bootstrap_gofile_session_state()
+        except Exception:
+            self.close()
+            raise
         atexit.register(self.close)
+
+    def _bootstrap_gofile_session_state(self) -> None:
+        if self._driver is None:
+            raise RuntimeError("Browser driver is not initialized")
+
+        self._driver.get("https://gofile.io/")
+        self._origin_ready = True
+
+        storage_payload = self._driver.execute_script(
+            """
+            const readStorage = (storage) => {
+                const values = {};
+                for (let i = 0; i < storage.length; i++) {
+                    const key = storage.key(i);
+                    values[key] = storage.getItem(key);
+                }
+                return values;
+            };
+
+            return {
+                localStorage: readStorage(window.localStorage),
+                sessionStorage: readStorage(window.sessionStorage),
+            };
+            """
+        )
+
+        cookies = self._driver.get_cookies()
+        if not isinstance(cookies, list):
+            cookies = []
+
+        if not isinstance(storage_payload, dict):
+            storage_payload = {}
+
+        local_storage = storage_payload.get("localStorage")
+        if not isinstance(local_storage, dict):
+            local_storage = {}
+
+        session_storage = storage_payload.get("sessionStorage")
+        if not isinstance(session_storage, dict):
+            session_storage = {}
+
+        snapshot = {
+            "origin": "https://gofile.io/",
+            "savedAt": int(time.time()),
+            "cookies": cookies,
+            "localStorage": local_storage,
+            "sessionStorage": session_storage,
+        }
+        self._persist_session_state(snapshot)
+        self._session_bootstrapped = True
+
+    def _persist_session_state(self, snapshot: Dict[str, Any]) -> None:
+        state_path = os.path.join(self.profile_dir, "gofile-session-state.json")
+        temp_path = f"{state_path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as state_file:
+            json.dump(snapshot, state_file, indent=2, sort_keys=True)
+        os.replace(temp_path, state_path)
 
     def _configure_browser_options(self, options: Any) -> None:
         options.add_argument("--headless=new")
@@ -81,11 +146,13 @@ class BrowserMetaTransport:
         with self._lock:
             if self._driver is None:
                 self._origin_ready = False
+                self._session_bootstrapped = False
                 return
 
             self._driver.quit()
             self._driver = None
             self._origin_ready = False
+            self._session_bootstrapped = False
 
     def _ensure_gofile_origin(self) -> None:
         if self._origin_ready:
@@ -108,6 +175,8 @@ class BrowserMetaTransport:
         request_url = self._build_url(url, params)
         with self._lock:
             self._ensure_driver()
+            if not self._session_bootstrapped:
+                raise RuntimeError("Browser session bootstrap did not complete")
             self._ensure_gofile_origin()
             if self._driver is None:
                 raise RuntimeError("Browser driver is not initialized")

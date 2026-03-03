@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import threading
@@ -69,6 +70,7 @@ def test_request_text_serializes_concurrent_access(tmp_path, monkeypatch):
 
     fake_driver = _FakeDriver()
     transport._driver = fake_driver
+    transport._session_bootstrapped = True
     monkeypatch.setattr(transport, "_ensure_driver", lambda: None)
 
     results = []
@@ -102,6 +104,7 @@ def test_request_text_warms_gofile_origin_before_first_fetch(tmp_path, monkeypat
             return '{"ok": true, "status": 200, "text": "ok"}'
 
     transport._driver = _FakeDriver()
+    transport._session_bootstrapped = True
     monkeypatch.setattr(transport, "_ensure_driver", lambda: None)
 
     response_text = transport.request_text("GET", "https://api.gofile.io/accounts")
@@ -123,6 +126,15 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_missing(tmp_path, monkeypa
             self.arguments.append(value)
 
     class _FakeChromeDriver:
+        def get(self, _url):
+            return None
+
+        def get_cookies(self):
+            return []
+
+        def execute_script(self, _script):
+            return {"localStorage": {}, "sessionStorage": {}}
+
         def quit(self):
             return None
 
@@ -161,6 +173,15 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, mon
             self.arguments.append(value)
 
     class _FakeChromeDriver:
+        def get(self, _url):
+            return None
+
+        def get_cookies(self):
+            return []
+
+        def execute_script(self, _script):
+            return {"localStorage": {}, "sessionStorage": {}}
+
         def quit(self):
             return None
 
@@ -192,3 +213,38 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, mon
 
     assert transport._driver is not None
     assert events == ["uc", "selenium"]
+
+
+def test_ensure_driver_persists_gofile_session_state(tmp_path, monkeypatch):
+    transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
+
+    class _FakeDriver:
+        def get(self, _url):
+            return None
+
+        def get_cookies(self):
+            return [{"name": "accountToken", "value": "token-123"}]
+
+        def execute_script(self, _script):
+            return {
+                "localStorage": {"theme": "light"},
+                "sessionStorage": {"wt": "wt-abc"},
+            }
+
+        def quit(self):
+            return None
+
+    monkeypatch.setattr(transport, "_create_browser_driver", lambda: _FakeDriver())
+
+    transport._ensure_driver()
+
+    state_path = os.path.join(str(tmp_path), "gofile-session-state.json")
+    assert os.path.exists(state_path)
+
+    with open(state_path, encoding="utf-8") as file_obj:
+        state = json.load(file_obj)
+
+    assert state["origin"] == "https://gofile.io/"
+    assert state["cookies"] == [{"name": "accountToken", "value": "token-123"}]
+    assert state["localStorage"]["theme"] == "light"
+    assert state["sessionStorage"]["wt"] == "wt-abc"
