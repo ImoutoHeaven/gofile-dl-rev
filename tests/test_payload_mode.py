@@ -205,3 +205,102 @@ def test_main_payload_mode_downloads_multiple_payloads_from_jsonl(tmp_path):
         ("https://cdn.example/a", os.path.join(str(tmp_path), "A.txt")),
         ("https://cdn.example/b", os.path.join(str(tmp_path), "B.txt")),
     ]
+
+
+def test_collect_download_jobs_from_payload_uses_relative_path(tmp_path):
+    payload = {
+        "type": "file",
+        "name": "ignored.txt",
+        "link": "https://cdn.example/a",
+        "relativePath": "Root/Sub/A.txt",
+    }
+
+    jobs = run.collect_download_jobs_from_payload(payload, base_dir=str(tmp_path))
+
+    assert jobs == [
+        ("https://cdn.example/a", os.path.join(str(tmp_path), "Root", "Sub", "A.txt"))
+    ]
+
+
+def test_execute_payload_records_failed_files_for_retry(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.failed_files = []
+
+    def _fake_download(link, file, **_kwargs):
+        return not link.endswith("/fail")
+
+    monkeypatch.setattr(client, "download", _fake_download)
+
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "folder",
+            "name": "Root",
+            "children": {
+                "ok-file": {
+                    "type": "file",
+                    "name": "A.txt",
+                    "link": "https://cdn.example/ok",
+                },
+                "failed-file": {
+                    "type": "file",
+                    "name": "B.txt",
+                    "link": "https://cdn.example/fail",
+                },
+            },
+        },
+    }
+
+    client.execute_payload(dir=str(tmp_path), payload=payload)
+
+    assert len(client.failed_files) == 1
+    failed = client.failed_files[0]
+    assert failed["type"] == "file"
+    assert failed["link"] == "https://cdn.example/fail"
+    assert failed["relativePath"] == "Root/B.txt"
+
+
+def test_main_writes_failed_files_json_parseable_for_payload_retry(tmp_path):
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "seed.txt",
+            "link": "https://cdn.example/seed",
+        },
+    }
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    class FakeGoFile:
+        def __init__(self):
+            self.token = ""
+            self.failed_files = []
+
+        def execute_payload(self, **_kwargs):
+            self.failed_files = [
+                {
+                    "type": "file",
+                    "name": "B.txt",
+                    "link": "https://cdn.example/fail",
+                    "relativePath": "Root/B.txt",
+                    "error": "network error",
+                }
+            ]
+
+    exit_code = run.main(
+        argv=["--content-payload-file", str(payload_file), "-d", str(tmp_path)],
+        gofile_factory=FakeGoFile,
+    )
+
+    failed_path = tmp_path / "failed_files.json"
+    assert exit_code == 0
+    assert failed_path.exists()
+
+    retry_payloads = run.load_content_payloads(str(failed_path))
+    assert len(retry_payloads) == 1
+    retry_jobs = run.collect_download_jobs_from_payload(retry_payloads[0], base_dir=str(tmp_path))
+    assert retry_jobs == [
+        ("https://cdn.example/fail", os.path.join(str(tmp_path), "Root", "B.txt"))
+    ]

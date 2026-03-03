@@ -301,7 +301,24 @@ def _walk_payload_node(
 
     fallback_file_name = f"file_{node_id[:8]}" if node_id else "file"
     file_name = _normalize_payload_name(node.get("name"), fallback_file_name, strip_emojis)
-    file_path = os.path.join(current_dir, sanitize_filename(file_name))
+
+    relative_path = node.get("relativePath")
+    if isinstance(relative_path, str) and relative_path.strip():
+        path_parts: List[str] = []
+        for raw_part in relative_path.replace("\\", "/").split("/"):
+            part = raw_part.strip()
+            if not part or part in (".", ".."):
+                continue
+            safe_part = sanitize_filename(part)
+            if safe_part:
+                path_parts.append(safe_part)
+        if path_parts:
+            file_path = os.path.join(current_dir, *path_parts)
+        else:
+            file_path = os.path.join(current_dir, sanitize_filename(file_name))
+    else:
+        file_path = os.path.join(current_dir, sanitize_filename(file_name))
+
     jobs.append((link, file_path))
 
 
@@ -334,6 +351,123 @@ def collect_download_jobs_from_payload(
         strip_emojis=strip_emojis,
     )
     return jobs
+
+
+def write_failed_files_report(failed_files: List[Dict[str, Any]], out_dir: str) -> Optional[str]:
+    """Persist failed download entries as a payload-retry JSON file."""
+    if not failed_files:
+        return None
+
+    os.makedirs(out_dir, exist_ok=True)
+    report_path = os.path.join(out_dir, "failed_files.json")
+    try:
+        with open(report_path, "w", encoding="utf-8") as report_fp:
+            json.dump(failed_files, report_fp, indent=2)
+    except OSError as e:
+        logger.error(f"Could not write failed files report: {e}")
+        return None
+
+    logger.warning(
+        "%s file(s) failed. Retry payload written to %s",
+        len(failed_files),
+        report_path,
+    )
+    return report_path
+
+
+def failed_files_report_path(out_dir: str) -> str:
+    """Return canonical failed-files report path for an output directory."""
+    return os.path.join(out_dir, "failed_files.json")
+
+
+def clear_failed_files_report(out_dir: str) -> None:
+    """Remove stale failed-files report after all retries succeed."""
+    report_path = failed_files_report_path(out_dir)
+    if os.path.exists(report_path):
+        try:
+            os.remove(report_path)
+        except OSError as e:
+            logger.warning(f"Could not remove stale failed files report: {e}")
+
+
+def parse_total_retries(raw_value: str) -> Optional[int]:
+    """Parse --total-retries as positive integer or 'inf'."""
+    normalized = raw_value.strip().lower()
+    if normalized == "inf":
+        return None
+
+    try:
+        parsed = int(normalized)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "--total-retries must be a positive integer or 'inf'"
+        ) from e
+
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("--total-retries must be >= 1")
+
+    return parsed
+
+
+def _run_payload_batch(
+    gofile_client: Any,
+    payloads: List[Dict[str, Any]],
+    out_dir: str,
+) -> None:
+    """Execute a payload batch using either execute_payload or download fallback."""
+    logger.info(f"Loaded {len(payloads)} payload object(s)")
+    for payload_index, payload in enumerate(payloads, start=1):
+        logger.info(f"Starting payload {payload_index}/{len(payloads)}")
+        if hasattr(gofile_client, "execute_payload"):
+            gofile_client.execute_payload(
+                dir=out_dir,
+                payload=payload,
+                progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
+                overall_progress_callback=lambda p, eta: logger.info(
+                    f"Overall progress: {p}% | ETA: {eta}"
+                ),
+                file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
+                    f"File {f} progress: {p}%"
+                ),
+            )
+        else:
+            jobs = collect_download_jobs_from_payload(payload, base_dir=out_dir)
+            for link, file_path in jobs:
+                downloaded = gofile_client.download(link, file_path)
+                if downloaded is False and hasattr(gofile_client, "failed_files"):
+                    gofile_client.failed_files.append(
+                        {
+                            "type": "file",
+                            "name": os.path.basename(file_path),
+                            "link": link,
+                            "relativePath": os.path.relpath(file_path, out_dir).replace(os.sep, "/"),
+                            "error": "download failed after retries",
+                        }
+                    )
+
+
+def _run_url_batch(
+    gofile_client: Any,
+    urls: List[str],
+    out_dir: str,
+    password: Optional[str],
+) -> None:
+    """Execute a URL batch through the standard /contents mode."""
+    for index, url in enumerate(urls, start=1):
+        logger.info(f"Starting download {index}/{len(urls)}: {url}")
+        gofile_client.execute(
+            dir=out_dir,
+            url=url,
+            password=password,
+            progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
+            overall_progress_callback=lambda p, eta: logger.info(
+                f"Overall progress: {p}% | ETA: {eta}"
+            ),
+            name_callback=lambda name: logger.info(f"Task name set to: {name}"),
+            file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
+                f"File {f} progress: {p}%"
+            ),
+        )
 
 def strip_emojis_func(text: str) -> str:
     """
@@ -542,10 +676,34 @@ class GoFile(metaclass=GoFileMeta):
         """Initialize the GoFile client and credential cache settings."""
         self.token: str = ""
         self.wt: str = ""
+        self.failed_files: List[Dict[str, Any]] = []
         self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
         self.wt_cache_ttl = self._read_ttl_env("GOFILE_WT_CACHE_TTL", DEFAULT_WT_CACHE_TTL)
         self.cache_file = os.path.join(get_runtime_config_dir(), ".gofile_api_cache.json")
         self._cache_loaded = False
+
+    def clear_failed_files(self) -> None:
+        """Reset in-memory failed download records for a new run."""
+        self.failed_files = []
+
+    def _record_failed_file(self, link: str, file_path: str, error: str, base_dir: str) -> None:
+        """Store failed file as payload-compatible entry for retry."""
+        try:
+            relative_path = os.path.relpath(file_path, base_dir)
+        except ValueError:
+            relative_path = os.path.basename(file_path)
+
+        if relative_path.startswith(".."):
+            relative_path = os.path.basename(file_path)
+
+        entry = {
+            "type": "file",
+            "name": os.path.basename(file_path),
+            "link": link,
+            "relativePath": relative_path.replace(os.sep, "/"),
+            "error": error,
+        }
+        self.failed_files.append(entry)
 
     @staticmethod
     def _read_ttl_env(env_name: str, default_value: int) -> int:
@@ -714,7 +872,8 @@ class GoFile(metaclass=GoFileMeta):
                 incremental: bool = False,
                 tracker: Optional[DownloadTracker] = None,
                 folder_pattern: Optional[str] = None,
-                auth_retry: bool = True) -> None:
+                auth_retry: bool = True,
+                failed_base_dir: Optional[str] = None) -> None:
         """
         Execute a download operation for a GoFile URL or content ID.
         
@@ -740,7 +899,11 @@ class GoFile(metaclass=GoFileMeta):
             tracker: Download tracker instance (created automatically if None)
             folder_pattern: Custom patterns to strip from folder names (pipe-separated)
             auth_retry: Retry once after forcing token/wt refresh when API auth fails
+            failed_base_dir: Root output directory used for failed-file retry paths
         """
+        if failed_base_dir is None:
+            failed_base_dir = dir
+
         if content_id is not None:
             self.update_token()
             self.update_wt()
@@ -795,6 +958,7 @@ class GoFile(metaclass=GoFileMeta):
                         tracker=tracker,
                         folder_pattern=folder_pattern,
                         auth_retry=False,
+                        failed_base_dir=failed_base_dir,
                     )
                     return
 
@@ -888,6 +1052,7 @@ class GoFile(metaclass=GoFileMeta):
                                 tracker=tracker,
                                 folder_pattern=folder_pattern,
                                 auth_retry=auth_retry,
+                                failed_base_dir=failed_base_dir,
                             )
                             files_completed += 1.0  # Count the folder as processed
                             
@@ -919,6 +1084,12 @@ class GoFile(metaclass=GoFileMeta):
                             
                             if not link:
                                 logger.error(f"No download link for file: {filename}")
+                                self._record_failed_file(
+                                    link="",
+                                    file_path=file_path,
+                                    error="missing direct download link",
+                                    base_dir=failed_base_dir,
+                                )
                                 files_completed += 1.0
                                 continue
                             
@@ -927,7 +1098,7 @@ class GoFile(metaclass=GoFileMeta):
                             if callable(file_progress_callback):
                                 file_progress_callback(file_path, 0)  # register start (0%)
                             
-                            self.download(
+                            was_downloaded = self.download(
                                 link, file_path, 
                                 progress_callback=progress_callback,
                                 cancel_event=cancel_event, 
@@ -937,13 +1108,21 @@ class GoFile(metaclass=GoFileMeta):
                                 retry_attempts=retry_attempts
                             )
                             
-                            # Mark as downloaded in incremental mode
-                            if incremental and tracker:
-                                tracker.mark_downloaded(child_id, filename)
-                            
-                            if callable(file_progress_callback):
-                                file_progress_callback(file_path, 100)  # file complete
-                            
+                            if was_downloaded:
+                                # Mark as downloaded in incremental mode
+                                if incremental and tracker:
+                                    tracker.mark_downloaded(child_id, filename)
+
+                                if callable(file_progress_callback):
+                                    file_progress_callback(file_path, 100)  # file complete
+                            else:
+                                self._record_failed_file(
+                                    link=link,
+                                    file_path=file_path,
+                                    error="download failed after retries",
+                                    base_dir=failed_base_dir,
+                                )
+                             
                             files_completed += 1.0
                             
                     except Exception as e_inner:
@@ -980,9 +1159,26 @@ class GoFile(metaclass=GoFileMeta):
                     name_callback(sanitize_filename(filename))
                 if callable(file_progress_callback):
                     file_progress_callback(file_path, 0)
-                self.download(link, file_path, progress_callback=progress_callback, cancel_event=cancel_event, file_progress_callback=file_progress_callback, pause_callback=pause_callback, throttle_speed=throttle_speed, retry_attempts=retry_attempts)
-                if callable(file_progress_callback):
-                    file_progress_callback(file_path, 100)
+                was_downloaded = self.download(
+                    link,
+                    file_path,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                    file_progress_callback=file_progress_callback,
+                    pause_callback=pause_callback,
+                    throttle_speed=throttle_speed,
+                    retry_attempts=retry_attempts,
+                )
+                if was_downloaded:
+                    if callable(file_progress_callback):
+                        file_progress_callback(file_path, 100)
+                else:
+                    self._record_failed_file(
+                        link=link,
+                        file_path=file_path,
+                        error="download failed after retries",
+                        base_dir=failed_base_dir,
+                    )
         elif url is not None:
             normalized_url = normalize_gofile_url(url)
             if normalized_url is None:
@@ -1008,6 +1204,7 @@ class GoFile(metaclass=GoFileMeta):
                 tracker=tracker,
                 folder_pattern=folder_pattern,
                 auth_retry=auth_retry,
+                failed_base_dir=failed_base_dir,
             )
         else:
             logger.error("Invalid parameters")
@@ -1041,7 +1238,7 @@ class GoFile(metaclass=GoFileMeta):
             if callable(file_progress_callback):
                 file_progress_callback(file_path, 0)
 
-            self.download(
+            was_downloaded = self.download(
                 link=link,
                 file=file_path,
                 progress_callback=progress_callback,
@@ -1052,8 +1249,17 @@ class GoFile(metaclass=GoFileMeta):
                 retry_attempts=retry_attempts,
             )
 
-            if callable(file_progress_callback):
-                file_progress_callback(file_path, 100)
+            if was_downloaded:
+                if callable(file_progress_callback):
+                    file_progress_callback(file_path, 100)
+            else:
+                self._record_failed_file(
+                    link=link,
+                    file_path=file_path,
+                    error="download failed after retries",
+                    base_dir=dir,
+                )
+
             if callable(overall_progress_callback):
                 overall_percent = int(index * 100 / total_jobs)
                 overall_progress_callback(overall_percent, "payload")
@@ -1068,7 +1274,7 @@ class GoFile(metaclass=GoFileMeta):
                 pause_callback: Optional[Callable[[], bool]] = None, 
                 throttle_speed: Optional[int] = None,
                 retry_attempts: int = 0, 
-                retry_delay: int = 5) -> None:
+                retry_delay: int = 5) -> bool:
         """
         Download a file from a GoFile link with various controls.
         
@@ -1085,7 +1291,7 @@ class GoFile(metaclass=GoFileMeta):
             retry_delay: Seconds to wait between retry attempts
             
         Returns:
-            None
+            bool: True when file is downloaded successfully, False otherwise
             
         Raises:
             Exception: If the download fails after all retry attempts
@@ -1158,7 +1364,7 @@ class GoFile(metaclass=GoFileMeta):
                     logger.info(f"Downloaded: {file} ({link})")
                     
                     # Download was successful, exit the retry loop
-                    return
+                    return True
                     
             except Exception as e:
                 attempts += 1
@@ -1176,6 +1382,8 @@ class GoFile(metaclass=GoFileMeta):
                     if file_progress_callback:
                         file_progress_callback(file, -2)  # -2 indicates permanent failure
                     break
+
+        return False
 
 def main(
     argv: Optional[List[str]] = None,
@@ -1208,6 +1416,12 @@ def main(
         action="store_true",
         help="force refresh account token and website token before download",
     )
+    parser.add_argument(
+        "--total-retries",
+        type=parse_total_retries,
+        default=3,
+        help="max retry rounds using failed_files payload (positive integer or 'inf')",
+    )
     args = parser.parse_args(argv)
 
     out_dir = args.dir if args.dir is not None else "./output"
@@ -1228,62 +1442,72 @@ def main(
         if hasattr(gofile_client, "_save_credential_cache"):
             gofile_client._save_credential_cache(token_updated=True)
 
-    if args.content_payload_file:
+    initial_payload_source = args.content_payload_file
+    urls: List[str] = []
+    if not initial_payload_source:
+        if args.url:
+            raw_urls = [args.url]
+        else:
+            logger.info("Batch mode: enter one URL per line, then press Enter twice to start")
+            raw_urls = collect_batch_urls(input_fn=input_fn)
+
+        urls, invalid_lines = filter_gofile_urls(raw_urls)
+        if invalid_lines:
+            logger.warning(f"Skipped {len(invalid_lines)} invalid URL line(s)")
+
+        if not urls:
+            logger.error("No valid GoFile URLs provided")
+            return 1
+
+    retry_round = 0
+    retry_limit = args.total_retries
+
+    while True:
+        if hasattr(gofile_client, "clear_failed_files"):
+            gofile_client.clear_failed_files()
+        elif hasattr(gofile_client, "failed_files"):
+            gofile_client.failed_files = []
+
         try:
-            payloads = load_content_payloads(args.content_payload_file)
-            logger.info(f"Loaded {len(payloads)} payload object(s)")
-            for payload_index, payload in enumerate(payloads, start=1):
-                logger.info(f"Starting payload {payload_index}/{len(payloads)}")
-                if hasattr(gofile_client, "execute_payload"):
-                    gofile_client.execute_payload(
-                        dir=out_dir,
-                        payload=payload,
-                        progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
-                        overall_progress_callback=lambda p, eta: logger.info(
-                            f"Overall progress: {p}% | ETA: {eta}"
-                        ),
-                        file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
-                            f"File {f} progress: {p}%"
-                        ),
-                    )
+            if retry_round == 0:
+                if initial_payload_source:
+                    payloads = load_content_payloads(initial_payload_source)
+                    _run_payload_batch(gofile_client, payloads, out_dir)
                 else:
-                    jobs = collect_download_jobs_from_payload(payload, base_dir=out_dir)
-                    for link, file_path in jobs:
-                        gofile_client.download(link, file_path)
-            return 0
+                    _run_url_batch(gofile_client, urls, out_dir, args.password)
+            else:
+                report_source = failed_files_report_path(out_dir)
+                limit_label = "inf" if retry_limit is None else str(retry_limit)
+                logger.info(
+                    f"Retry round {retry_round}/{limit_label} using payload report: {report_source}"
+                )
+                retry_payloads = load_content_payloads(report_source)
+                _run_payload_batch(gofile_client, retry_payloads, out_dir)
         except ValueError as payload_error:
             logger.error(f"Invalid content payload: {payload_error}")
             return 1
 
-    if args.url:
-        raw_urls = [args.url]
-    else:
-        logger.info("Batch mode: enter one URL per line, then press Enter twice to start")
-        raw_urls = collect_batch_urls(input_fn=input_fn)
+        failed_entries = getattr(gofile_client, "failed_files", [])
+        if not isinstance(failed_entries, list):
+            failed_entries = []
 
-    urls, invalid_lines = filter_gofile_urls(raw_urls)
-    if invalid_lines:
-        logger.warning(f"Skipped {len(invalid_lines)} invalid URL line(s)")
+        if not failed_entries:
+            clear_failed_files_report(out_dir)
+            break
 
-    if not urls:
-        logger.error("No valid GoFile URLs provided")
-        return 1
+        report_path = write_failed_files_report(failed_entries, out_dir)
+        if not report_path:
+            logger.error("Cannot continue retry loop because failed_files report was not written")
+            return 1
 
-    for index, url in enumerate(urls, start=1):
-        logger.info(f"Starting download {index}/{len(urls)}: {url}")
-        gofile_client.execute(
-            dir=out_dir,
-            url=url,
-            password=args.password,
-            progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
-            overall_progress_callback=lambda p, eta: logger.info(
-                f"Overall progress: {p}% | ETA: {eta}"
-            ),
-            name_callback=lambda name: logger.info(f"Task name set to: {name}"),
-            file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
-                f"File {f} progress: {p}%"
-            ),
-        )
+        if retry_limit is not None and retry_round >= retry_limit:
+            logger.error(
+                "Reached --total-retries limit with %s unresolved failed file(s)",
+                len(failed_entries),
+            )
+            break
+
+        retry_round += 1
 
     return 0
 

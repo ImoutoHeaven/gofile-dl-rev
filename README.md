@@ -93,6 +93,12 @@ cat payload.json | python run.py --content-payload-file - -d "./output"
 
 # Batch payload mode (JSON Lines: one payload JSON per line)
 python run.py --content-payload-file payloads.jsonl -d "./output"
+
+# Auto-retry unresolved failures through payload mode (default is 3)
+python run.py --total-retries 3 -d "./output"
+
+# Infinite retry loop until failed_files.json is empty
+python run.py --total-retries inf -d "./output"
 ```
 
 Batch mode behavior:
@@ -108,6 +114,16 @@ Payload mode behavior:
 - Extracts direct `link` values recursively and downloads without calling `/contents` again
 - Useful when `/contents` endpoint is rate-limited from your current IP
 - Supports single JSON object, JSON object array, or JSON Lines batch input
+- Failed downloads are written to `failed_files.json` in the output directory
+- `failed_files.json` is payload-retry compatible (includes `type=file`, `link`, `relativePath`)
+- Retry failed files directly: `python run.py --content-payload-file ./output/failed_files.json -d ./output`
+
+Retry loop behavior:
+
+- `--total-retries` controls retry rounds **after** the first run
+- Retry round 2+ automatically parses `failed_files.json` in payload mode
+- Allowed values: positive integer (`1`, `2`, ...) or `inf`
+- Default is `3`
 
 Credential cache behavior (for lower GoFile account creation pressure):
 
