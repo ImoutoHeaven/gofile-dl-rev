@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoFile Payload Exporter (JSONL)
 // @namespace    https://gofile.io/
-// @version      0.4.1
+// @version      0.4.2
 // @description  Batch fetch GoFile /contents payloads from real browser session and export JSONL.
 // @author       OpenCode
 // @match        https://gofile.io/*
@@ -23,6 +23,7 @@
   const CAPTURE_HASH_JOB = "gpx_capture_job";
   const CAPTURE_HASH_CID = "gpx_capture_cid";
   const CAPTURE_TIMEOUT_MS = 35000;
+  const EXPAND_MAX_DEPTH = 16;
 
   const state = {
     running: false,
@@ -929,6 +930,167 @@
       return { empty: false, targets, failures };
     }
 
+    function buildFolderUrlFromCode(code) {
+      return `https://gofile.io/d/${encodeURIComponent(String(code || "").trim())}`;
+    }
+
+    async function capturePayloadForTarget(target, options, logPrefix) {
+      let lastError = "capture failed";
+
+      for (let attempt = 0; attempt <= options.maxRetries; attempt += 1) {
+        const jobId = generateJobId();
+        const captureUrl = buildCaptureTabUrl(target.url, jobId, target.contentId);
+        const tabHandle = openCaptureTab(captureUrl);
+        if (tabHandle.blocked) {
+          lastError = "failed to open capture tab (popup blocked)";
+          appendLog(`${logPrefix} FAIL ${target.contentId}: ${lastError}`);
+          return { ok: false, error: lastError };
+        }
+
+        appendLog(
+          `${logPrefix} Opened capture tab for ${target.contentId} (attempt ${attempt + 1}/${options.maxRetries + 1})`
+        );
+
+        const result = await waitForCaptureResult(jobId, CAPTURE_TIMEOUT_MS + 2000);
+        tabHandle.close();
+
+        if (result && result.ok && result.payload) {
+          appendLog(`${logPrefix} OK ${target.contentId} via ${result.source || "page"}`);
+          return { ok: true, payload: result.payload };
+        }
+
+        lastError = (result && result.error) || "capture attempt failed";
+        appendLog(`${logPrefix} Attempt ${attempt + 1} failed for ${target.contentId}: ${lastError}`);
+
+        if (attempt < options.maxRetries) {
+          const waitMs = Math.round(options.baseDelayMs * Math.pow(1.7, attempt + 1));
+          if (waitMs > 0) {
+            appendLog(`- ${target.contentId}: retry capture in ${waitMs}ms`);
+            await sleep(waitMs);
+          }
+        }
+      }
+
+      return { ok: false, error: lastError };
+    }
+
+    async function expandFolderNodeChildren(node, options, logPrefix, cache, seenCodes, depth) {
+      if (!node || typeof node !== "object") {
+        return;
+      }
+
+      if (depth > EXPAND_MAX_DEPTH) {
+        appendLog(`${logPrefix} Reached max expansion depth (${EXPAND_MAX_DEPTH}), stopping recursion`);
+        return;
+      }
+
+      const children = node.children;
+      if (!children || typeof children !== "object") {
+        return;
+      }
+
+      for (const childId of Object.keys(children)) {
+        const child = children[childId];
+        if (!child || typeof child !== "object") {
+          continue;
+        }
+
+        if (String(child.type || "").toLowerCase() !== "folder") {
+          continue;
+        }
+
+        const childChildren = child.children;
+        const hasEmbeddedChildren =
+          childChildren &&
+          typeof childChildren === "object" &&
+          Object.keys(childChildren).length > 0;
+        const childCount = Number.parseInt(String(child.childrenCount || 0), 10);
+        const childCode = String(child.code || "").trim();
+
+        if (!hasEmbeddedChildren && childCount > 0) {
+          if (!childCode) {
+            appendLog(`${logPrefix} Skip nested folder without code (id=${childId})`);
+            continue;
+          }
+
+          if (!seenCodes.has(childCode)) {
+            seenCodes.add(childCode);
+            let expandedPayload = cache.get(childCode);
+
+            if (!expandedPayload) {
+              const expandTarget = {
+                contentId: childCode,
+                url: buildFolderUrlFromCode(childCode),
+              };
+
+              const expandResult = await capturePayloadForTarget(
+                expandTarget,
+                options,
+                `${logPrefix}[expand]`
+              );
+              if (!expandResult.ok || !expandResult.payload) {
+                appendLog(`${logPrefix}[expand] Failed to expand folder ${childCode}: ${expandResult.error}`);
+                continue;
+              }
+
+              expandedPayload = expandResult.payload;
+              cache.set(childCode, expandedPayload);
+            }
+
+            if (
+              expandedPayload &&
+              expandedPayload.status === "ok" &&
+              expandedPayload.data &&
+              typeof expandedPayload.data === "object" &&
+              String(expandedPayload.data.type || "").toLowerCase() === "folder"
+            ) {
+              const expandedChildren = expandedPayload.data.children;
+              child.children =
+                expandedChildren && typeof expandedChildren === "object" ? expandedChildren : {};
+
+              if (Object.prototype.hasOwnProperty.call(expandedPayload.data, "childrenCount")) {
+                child.childrenCount = expandedPayload.data.childrenCount;
+              }
+              if (Object.prototype.hasOwnProperty.call(expandedPayload.data, "totalSize")) {
+                child.totalSize = expandedPayload.data.totalSize;
+              }
+              if (Object.prototype.hasOwnProperty.call(expandedPayload.data, "totalDownloadCount")) {
+                child.totalDownloadCount = expandedPayload.data.totalDownloadCount;
+              }
+
+              appendLog(
+                `${logPrefix}[expand] Expanded folder ${childCode} with ${Object.keys(child.children).length} child node(s)`
+              );
+            }
+          }
+        }
+
+        if (child.children && typeof child.children === "object" && Object.keys(child.children).length > 0) {
+          await expandFolderNodeChildren(child, options, logPrefix, cache, seenCodes, depth + 1);
+        }
+      }
+    }
+
+    async function expandPayloadTree(payload, options, logPrefix, cache) {
+      if (!payload || payload.status !== "ok") {
+        return;
+      }
+      if (!payload.data || typeof payload.data !== "object") {
+        return;
+      }
+      if (String(payload.data.type || "").toLowerCase() !== "folder") {
+        return;
+      }
+
+      const seenCodes = new Set();
+      const rootCode = String(payload.data.code || "").trim();
+      if (rootCode) {
+        seenCodes.add(rootCode);
+      }
+
+      await expandFolderNodeChildren(payload.data, options, logPrefix, cache, seenCodes, 0);
+    }
+
     function applyResults(successPayloads, failures) {
       state.outputJsonl = successPayloads.map((payload) => JSON.stringify(payload)).join("\n");
       state.outputBundleBase64 = buildPayloadBundleBase64(state.outputJsonl);
@@ -985,56 +1147,34 @@
         appendLog("Mode: capture real page /contents responses");
         appendLog(`Targets: ${targets.length}, Invalid lines: ${failures.length}`);
         const successPayloads = [];
+        const expansionCache = new Map();
 
         for (let index = 0; index < targets.length; index += 1) {
           const target = targets[index];
           setStatus(`Capturing ${index + 1}/${targets.length}: ${target.url}`);
 
-          let captured = false;
-          let lastError = "capture failed";
+          const captureResult = await capturePayloadForTarget(
+            target,
+            options,
+            `[${index + 1}/${targets.length}]`
+          );
 
-          for (let attempt = 0; attempt <= options.maxRetries; attempt += 1) {
-            const jobId = generateJobId();
-            const captureUrl = buildCaptureTabUrl(target.url, jobId, target.contentId);
-            const tabHandle = openCaptureTab(captureUrl);
-            if (tabHandle.blocked) {
-              lastError = "failed to open capture tab (popup blocked)";
-              appendLog(`[${index + 1}/${targets.length}] FAIL ${target.contentId}: ${lastError}`);
-              break;
-            }
-
-            appendLog(
-              `[${index + 1}/${targets.length}] Opened capture tab for ${target.contentId} (attempt ${attempt + 1}/${options.maxRetries + 1})`
+          if (!captureResult.ok || !captureResult.payload) {
+            failures.push({
+              url: target.url,
+              contentId: target.contentId,
+              error: captureResult.error || "capture failed",
+            });
+          } else {
+            expansionCache.set(target.contentId, captureResult.payload);
+            setStatus(`Expanding ${index + 1}/${targets.length}: ${target.url}`);
+            await expandPayloadTree(
+              captureResult.payload,
+              options,
+              `[${index + 1}/${targets.length}]`,
+              expansionCache
             );
-
-            const result = await waitForCaptureResult(jobId, CAPTURE_TIMEOUT_MS + 2000);
-            tabHandle.close();
-
-            if (result && result.ok && result.payload) {
-              successPayloads.push(result.payload);
-              captured = true;
-              appendLog(
-                `[${index + 1}/${targets.length}] OK ${target.contentId} via ${result.source || "page"}`
-              );
-              break;
-            }
-
-            lastError = (result && result.error) || "capture attempt failed";
-            appendLog(
-              `[${index + 1}/${targets.length}] Attempt ${attempt + 1} failed for ${target.contentId}: ${lastError}`
-            );
-
-            if (attempt < options.maxRetries) {
-              const waitMs = Math.round(options.baseDelayMs * Math.pow(1.7, attempt + 1));
-              if (waitMs > 0) {
-                appendLog(`- ${target.contentId}: retry capture in ${waitMs}ms`);
-                await sleep(waitMs);
-              }
-            }
-          }
-
-          if (!captured) {
-            failures.push({ url: target.url, contentId: target.contentId, error: lastError });
+            successPayloads.push(captureResult.payload);
           }
 
           if (index < targets.length - 1 && options.baseDelayMs > 0) {
