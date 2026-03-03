@@ -131,3 +131,7 @@ dmypy.json
 .sqlite
 # output dir
 output/
+
+# local workspace artifacts
+.worktrees/
+docs/plans/
