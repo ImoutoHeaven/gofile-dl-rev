@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoFile Payload Exporter (JSONL)
 // @namespace    https://gofile.io/
-// @version      0.3.0
+// @version      0.4.0
 // @description  Batch fetch GoFile /contents payloads from real browser session and export JSONL.
 // @author       OpenCode
 // @match        https://gofile.io/*
@@ -27,6 +27,7 @@
   const state = {
     running: false,
     outputJsonl: "",
+    outputBundleBase64: "",
     failures: [],
   };
 
@@ -424,7 +425,6 @@
     injectPageCaptureBridge(config.contentId);
 
     let finished = false;
-    let seenContentsResponse = false;
     let lastError = "no /contents response captured";
 
     function finish(message) {
@@ -464,7 +464,6 @@
         return;
       }
 
-      seenContentsResponse = true;
       const payload = parseJsonSafe(detail.bodyText);
       if (!payload || typeof payload !== "object") {
         lastError = `captured non-JSON /contents response (method=${method}, http=${detail.statusCode || "?"})`;
@@ -526,8 +525,108 @@
     return `${status}: ${details.join(" | ")}`;
   }
 
-  function downloadTextFile(filename, text) {
-    const blob = new Blob([text], { type: "application/x-ndjson;charset=utf-8" });
+  function getCookieValue(name) {
+    const escapedName = String(name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = document.cookie.match(new RegExp(`(?:^|; )${escapedName}=([^;]*)`));
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+
+  function parseAccountTokenString(raw) {
+    const cleaned = String(raw || "").trim();
+    if (!cleaned) {
+      return "";
+    }
+
+    const assignmentMatch = cleaned.match(/data\.token\s*[:=]\s*['\"]?([^'\"\s,}]+)/i);
+    if (assignmentMatch && assignmentMatch[1]) {
+      return assignmentMatch[1].trim();
+    }
+
+    const parsed = parseJsonSafe(cleaned);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.token === "string" && parsed.token.trim()) {
+        return parsed.token.trim();
+      }
+      if (parsed.data && typeof parsed.data === "object") {
+        if (typeof parsed.data.token === "string" && parsed.data.token.trim()) {
+          return parsed.data.token.trim();
+        }
+      }
+    }
+
+    return cleaned;
+  }
+
+  function resolveAccountToken() {
+    const fromCookie = parseAccountTokenString(getCookieValue("accountToken"));
+    if (fromCookie) {
+      return fromCookie;
+    }
+
+    const root = typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : window;
+    if (root && root.appdata && typeof root.appdata === "object") {
+      const fromAppData = parseAccountTokenString(root.appdata.accountToken || root.appdata.token || "");
+      if (fromAppData) {
+        return fromAppData;
+      }
+    }
+
+    try {
+      const candidates = [
+        localStorage.getItem("accountToken"),
+        localStorage.getItem("token"),
+        sessionStorage.getItem("accountToken"),
+        sessionStorage.getItem("token"),
+      ];
+      for (const candidate of candidates) {
+        const parsed = parseAccountTokenString(candidate || "");
+        if (parsed) {
+          return parsed;
+        }
+      }
+    } catch (_error) {
+      // Ignore storage access errors.
+    }
+
+    return "";
+  }
+
+  function toBase64UrlUtf8(text) {
+    const bytes = new TextEncoder().encode(String(text || ""));
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      const slice = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+      binary += String.fromCharCode.apply(null, Array.from(slice));
+    }
+
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function buildPayloadBundleBase64(payloadJsonl) {
+    const jsonl = String(payloadJsonl || "").trim();
+    if (!jsonl) {
+      return "";
+    }
+
+    const accountToken = resolveAccountToken();
+    const lineCount = jsonl.split(/\r?\n/).filter(Boolean).length;
+    const bundle = {
+      schema: "gofile-payload-bundle/v1",
+      accountToken,
+      payloadJsonl: jsonl,
+      meta: {
+        source: "tampermonkey-gofile-payload-exporter",
+        generatedAt: new Date().toISOString(),
+        payloadCount: lineCount,
+      },
+    };
+
+    return toBase64UrlUtf8(JSON.stringify(bundle));
+  }
+
+  function downloadTextFile(filename, text, mimeType) {
+    const blob = new Blob([text], { type: mimeType || "text/plain;charset=utf-8" });
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = objectUrl;
@@ -717,6 +816,8 @@
         <button type="button" class="gpx-primary" data-gpx-capture>Capture from page tabs</button>
         <button type="button" data-gpx-copy>Copy JSONL</button>
         <button type="button" data-gpx-download>Download JSONL</button>
+        <button type="button" data-gpx-copy-bundle>Copy Bundle (base64)</button>
+        <button type="button" data-gpx-download-bundle>Download Bundle</button>
         <button type="button" data-gpx-clear>Clear</button>
       </div>
       <div class="gpx-status" data-gpx-status>Idle</div>
@@ -738,6 +839,8 @@
       captureButton: panel.querySelector("[data-gpx-capture]"),
       copyButton: panel.querySelector("[data-gpx-copy]"),
       downloadButton: panel.querySelector("[data-gpx-download]"),
+      copyBundleButton: panel.querySelector("[data-gpx-copy-bundle]"),
+      downloadBundleButton: panel.querySelector("[data-gpx-download-bundle]"),
       clearButton: panel.querySelector("[data-gpx-clear]"),
       closeButton: panel.querySelector("[data-gpx-close]"),
       status: panel.querySelector("[data-gpx-status]"),
@@ -764,6 +867,8 @@
       refs.captureButton.disabled = running;
       refs.copyButton.disabled = running;
       refs.downloadButton.disabled = running;
+      refs.copyBundleButton.disabled = running;
+      refs.downloadBundleButton.disabled = running;
       refs.clearButton.disabled = running;
       refs.input.disabled = running;
       refs.delayInput.disabled = running;
@@ -813,6 +918,7 @@
 
     function applyResults(successPayloads, failures) {
       state.outputJsonl = successPayloads.map((payload) => JSON.stringify(payload)).join("\n");
+      state.outputBundleBase64 = buildPayloadBundleBase64(state.outputJsonl);
       state.failures = failures;
       refs.output.value = state.outputJsonl;
 
@@ -948,12 +1054,62 @@
         return;
       }
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      downloadTextFile(`gofile-payloads-${stamp}.jsonl`, `${state.outputJsonl}\n`);
+      downloadTextFile(
+        `gofile-payloads-${stamp}.jsonl`,
+        `${state.outputJsonl}\n`,
+        "application/x-ndjson;charset=utf-8"
+      );
       setStatus("Downloaded JSONL file.");
+    }
+
+    async function handleCopyBundle() {
+      if (!state.outputJsonl) {
+        setStatus("No JSONL output to bundle.");
+        return;
+      }
+
+      if (!state.outputBundleBase64) {
+        state.outputBundleBase64 = buildPayloadBundleBase64(state.outputJsonl);
+      }
+      if (!state.outputBundleBase64) {
+        setStatus("Could not build payload bundle.");
+        return;
+      }
+
+      try {
+        const copied = await copyText(state.outputBundleBase64);
+        if (copied) {
+          setStatus("Copied base64 payload bundle. CLI: run.py -pb then paste + double Enter.");
+        } else {
+          setStatus("Clipboard not available in this context.");
+        }
+      } catch (error) {
+        setStatus(`Copy bundle failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    function handleDownloadBundle() {
+      if (!state.outputJsonl) {
+        setStatus("No JSONL output to bundle.");
+        return;
+      }
+
+      if (!state.outputBundleBase64) {
+        state.outputBundleBase64 = buildPayloadBundleBase64(state.outputJsonl);
+      }
+      if (!state.outputBundleBase64) {
+        setStatus("Could not build payload bundle.");
+        return;
+      }
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      downloadTextFile(`gofile-payload-bundle-${stamp}.txt`, `${state.outputBundleBase64}\n`);
+      setStatus("Downloaded base64 payload bundle.");
     }
 
     function handleClear() {
       state.outputJsonl = "";
+      state.outputBundleBase64 = "";
       state.failures = [];
       refs.output.value = "";
       refs.log.textContent = "";
@@ -970,6 +1126,10 @@
       void handleCopy();
     });
     refs.downloadButton.addEventListener("click", handleDownload);
+    refs.copyBundleButton.addEventListener("click", () => {
+      void handleCopyBundle();
+    });
+    refs.downloadBundleButton.addEventListener("click", handleDownloadBundle);
     refs.clearButton.addEventListener("click", handleClear);
 
     setStatus("Idle");

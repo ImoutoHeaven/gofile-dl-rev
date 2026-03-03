@@ -1,4 +1,5 @@
 import json
+import base64
 import os
 import sys
 
@@ -180,6 +181,104 @@ def test_load_content_payloads_supports_blank_line_separated_multiline_json(tmp_
     assert len(payloads) == 2
     assert payloads[0]["data"]["name"] == "A.txt"
     assert payloads[1]["data"]["name"] == "B.txt"
+
+
+def test_parse_payload_bundle_supports_json_with_payload_jsonl():
+    payload_a = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "link": "https://cdn.example/a",
+        },
+    }
+    payload_b = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "B.txt",
+            "link": "https://cdn.example/b",
+        },
+    }
+    bundle = {
+        "schema": "gofile-payload-bundle/v1",
+        "accountToken": "data.token = bundle-token",
+        "payloadJsonl": "\n".join([json.dumps(payload_a), json.dumps(payload_b)]),
+    }
+
+    token, payloads = run.parse_payload_bundle(json.dumps(bundle))
+
+    assert token == "bundle-token"
+    assert [payload["data"]["name"] for payload in payloads] == ["A.txt", "B.txt"]
+
+
+def test_parse_payload_bundle_supports_base64url_blob():
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "link": "https://cdn.example/a",
+        },
+    }
+    bundle = {
+        "schema": "gofile-payload-bundle/v1",
+        "accountToken": "bundle-token",
+        "payloads": [payload],
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(bundle).encode("utf-8")).decode("ascii").rstrip("=")
+
+    token, payloads = run.parse_payload_bundle(encoded)
+
+    assert token == "bundle-token"
+    assert payloads == [payload]
+
+
+def test_main_payload_bundle_prompt_mode_parses_double_blank_terminated_input(tmp_path):
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "link": "https://cdn.example/a",
+        },
+    }
+    bundle = {
+        "schema": "gofile-payload-bundle/v1",
+        "accountToken": "data.token=bundle-token",
+        "payloads": [payload],
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(bundle).encode("utf-8")).decode("ascii").rstrip("=")
+
+    calls = []
+
+    class FakeGoFile:
+        def __init__(self):
+            self.token = ""
+
+        def download(self, link, file, **_kwargs):
+            calls.append((link, file, self.token))
+
+    lines = [encoded[:20], encoded[20:], "", ""]
+    line_iter = iter(lines)
+
+    def _input_fn(_prompt=""):
+        return next(line_iter)
+
+    exit_code = run.main(
+        argv=["-pb", "-d", str(tmp_path)],
+        input_fn=_input_fn,
+        gofile_factory=FakeGoFile,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        (
+            "https://cdn.example/a",
+            os.path.join(str(tmp_path), "A.txt"),
+            "bundle-token",
+        )
+    ]
 
 
 def test_main_payload_mode_downloads_multiple_payloads_from_jsonl(tmp_path):

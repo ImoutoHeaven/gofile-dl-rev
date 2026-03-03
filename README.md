@@ -97,6 +97,13 @@ python run.py --content-payload-file payloads.jsonl -d "./output"
 # Batch payload mode from pretty JSON blocks (separate payloads with a blank line)
 cat payloads.txt | python run.py --content-payload-file - -d "./output"
 
+# Payload bundle mode (base64/JSON bundle that includes accountToken + payloads)
+# Paste bundle text, then press Enter twice to start
+python run.py -pb -d "./output"
+
+# Payload bundle mode from direct argument
+python run.py --payload-bundle "BASE64_OR_JSON_BUNDLE" -d "./output"
+
 # Auto-retry unresolved failures through payload mode (default is 3)
 python run.py --total-retries 3 -d "./output"
 
@@ -117,6 +124,8 @@ Payload mode behavior:
 - Extracts direct `link` values recursively and downloads without calling `/contents` again
 - Useful when `/contents` endpoint is rate-limited from your current IP
 - Supports single JSON object, JSON object array, JSON Lines, or whitespace-delimited JSON objects (for example, pretty JSON blocks separated by blank lines)
+- Supports payload bundles (`-pb` / `--payload-bundle`): if trimmed input starts with `{`, parse as JSON; otherwise decode as base64/base64url JSON
+- Bundle format supports `accountToken` + `payloads` / `payload` / `payloadJsonl`; when `--account-token` is not provided, CLI reuses `accountToken` from bundle
 - Automatically skips already-downloaded files when payload metadata matches (`size`/`md5`)
 - Failed downloads are written to `failed_files.json` in the output directory
 - `failed_files.json` is payload-retry compatible (includes `type=file`, `link`, `relativePath`)

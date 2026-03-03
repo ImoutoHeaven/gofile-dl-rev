@@ -1,4 +1,6 @@
 import argparse
+import base64
+import binascii
 import logging
 import os
 import sys
@@ -42,6 +44,7 @@ DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
 DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
 DEFAULT_CONTENTS_PAGE_SIZE = 1000
 NOT_PREMIUM_STATUS = "error-notpremium"
+PAYLOAD_BUNDLE_PROMPT_SENTINEL = "__GOFILE_PAYLOAD_BUNDLE_PROMPT__"
 
 
 class _MetaTransportProtocol(Protocol):
@@ -229,6 +232,114 @@ def collect_batch_urls(input_fn: Callable[[str], str] = input) -> List[str]:
     return collected
 
 
+def collect_multiline_block(input_fn: Callable[[str], str] = input) -> str:
+    """Collect a multiline text block from stdin, ending on two blank lines."""
+    lines: List[str] = []
+    blank_streak = 0
+
+    while True:
+        try:
+            line = input_fn("")
+        except EOFError:
+            break
+
+        cleaned = line.strip()
+        if not cleaned:
+            blank_streak += 1
+            if blank_streak >= 2:
+                break
+            lines.append("")
+            continue
+
+        blank_streak = 0
+        lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+def _decode_payload_bundle_text(raw_bundle: str) -> str:
+    """Decode raw payload-bundle input as JSON text or base64/base64url JSON text."""
+    cleaned = raw_bundle.strip()
+    if not cleaned:
+        raise ValueError("Payload bundle is empty")
+
+    if cleaned.startswith("{"):
+        return cleaned
+
+    compact = "".join(cleaned.split())
+    compact = compact.replace("-", "+").replace("_", "/")
+    if not compact:
+        raise ValueError("Payload bundle is empty")
+
+    padding = (-len(compact)) % 4
+    if padding:
+        compact += "=" * padding
+
+    try:
+        decoded_bytes = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(
+            "Payload bundle must be JSON text (starting with '{') or a valid base64 string"
+        ) from e
+
+    try:
+        return decoded_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError("Payload bundle base64 content is not valid UTF-8 JSON text") from e
+
+
+def _extract_payloads_from_bundle(bundle_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract payload object list from parsed bundle object."""
+    payloads_candidate: Any = None
+
+    if isinstance(bundle_payload.get("payloads"), list):
+        payloads_candidate = bundle_payload.get("payloads")
+    elif isinstance(bundle_payload.get("payload"), dict):
+        payloads_candidate = [bundle_payload.get("payload")]
+    elif isinstance(bundle_payload.get("payloadJsonl"), str):
+        payloads_candidate = _decode_payload_stream(bundle_payload["payloadJsonl"])
+    elif isinstance(bundle_payload.get("jsonl"), str):
+        payloads_candidate = _decode_payload_stream(bundle_payload["jsonl"])
+
+    if not isinstance(payloads_candidate, list) or not payloads_candidate:
+        raise ValueError(
+            "Payload bundle must include non-empty 'payloads' list, 'payload' object, or 'payloadJsonl' text"
+        )
+
+    payloads: List[Dict[str, Any]] = []
+    for index, item in enumerate(payloads_candidate, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Payload bundle item {index} must be a JSON object")
+        payloads.append(item)
+
+    return payloads
+
+
+def parse_payload_bundle(raw_bundle: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Parse payload-bundle text and return (account_token, payload_objects)."""
+    bundle_text = _decode_payload_bundle_text(raw_bundle)
+
+    try:
+        bundle_payload = json.loads(bundle_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Payload bundle JSON is invalid (line {e.lineno}, column {e.colno}): {e.msg}"
+        ) from e
+
+    if not isinstance(bundle_payload, dict):
+        raise ValueError("Payload bundle root must be a JSON object")
+
+    account_token: Optional[str] = None
+    account_token_raw = bundle_payload.get("accountToken")
+    if not isinstance(account_token_raw, str):
+        account_token_raw = bundle_payload.get("account_token")
+    if isinstance(account_token_raw, str) and account_token_raw.strip():
+        account_token = extract_account_token(account_token_raw)
+
+    payloads = _extract_payloads_from_bundle(bundle_payload)
+    return account_token, payloads
+
+
 def _read_payload_source(payload_source: str) -> str:
     """Read payload text from file path or stdin ('-')."""
     try:
@@ -244,6 +355,22 @@ def _read_payload_source(payload_source: str) -> str:
         raise ValueError("Content payload source is empty")
 
     return raw_payload
+
+
+def read_payload_bundle_input(
+    payload_bundle_arg: str,
+    input_fn: Callable[[str], str] = input,
+) -> str:
+    """Resolve payload-bundle arg as direct text or interactive paste block."""
+    if payload_bundle_arg != PAYLOAD_BUNDLE_PROMPT_SENTINEL:
+        return payload_bundle_arg
+
+    logger.info("Payload-bundle mode: paste JSON/base64 bundle, then press Enter twice to finish")
+    raw_bundle = collect_multiline_block(input_fn=input_fn)
+    if not raw_bundle.strip():
+        raise ValueError("Payload bundle input is empty")
+
+    return raw_bundle
 
 
 def _decode_payload_stream(raw_payload: str) -> List[Any]:
@@ -1781,11 +1908,23 @@ def main(
         dest="account_token",
         help="reuse an existing account token; supports raw token or data.token=...",
     )
-    parser.add_argument(
+    payload_source_group = parser.add_mutually_exclusive_group()
+    payload_source_group.add_argument(
         "--content-payload-file",
         type=str,
         dest="content_payload_file",
         help="download from a raw /contents API JSON payload file (use '-' for stdin)",
+    )
+    payload_source_group.add_argument(
+        "-pb",
+        "--payload-bundle",
+        nargs="?",
+        const=PAYLOAD_BUNDLE_PROMPT_SENTINEL,
+        dest="payload_bundle",
+        help=(
+            "payload bundle text that includes accountToken + payloads (JSON or base64). "
+            "Use '-pb' alone to paste bundle interactively and end with two blank lines"
+        ),
     )
     parser.add_argument(
         "--refresh-auth",
@@ -1802,6 +1941,18 @@ def main(
 
     out_dir = args.dir if args.dir is not None else "./output"
 
+    initial_payload_source = args.content_payload_file
+    initial_bundle_payloads: Optional[List[Dict[str, Any]]] = None
+    bundle_account_token: Optional[str] = None
+
+    if args.payload_bundle is not None:
+        try:
+            raw_bundle = read_payload_bundle_input(args.payload_bundle, input_fn=input_fn)
+            bundle_account_token, initial_bundle_payloads = parse_payload_bundle(raw_bundle)
+        except ValueError as bundle_error:
+            logger.error(f"Invalid payload bundle: {bundle_error}")
+            return 1
+
     gofile_client = gofile_factory()
     if hasattr(gofile_client, "set_failed_report_dir"):
         gofile_client.set_failed_report_dir(out_dir)
@@ -1811,6 +1962,8 @@ def main(
     manual_account_token = None
     if args.account_token:
         manual_account_token = extract_account_token(args.account_token)
+    elif bundle_account_token:
+        manual_account_token = bundle_account_token
 
     if args.refresh_auth:
         if hasattr(gofile_client, "update_token") and manual_account_token is None:
@@ -1823,9 +1976,8 @@ def main(
         if hasattr(gofile_client, "_save_credential_cache"):
             gofile_client._save_credential_cache(token_updated=True)
 
-    initial_payload_source = args.content_payload_file
     urls: List[str] = []
-    if not initial_payload_source:
+    if not initial_payload_source and initial_bundle_payloads is None:
         if args.url:
             raw_urls = [args.url]
         else:
@@ -1854,6 +2006,8 @@ def main(
                 if initial_payload_source:
                     payloads = load_content_payloads(initial_payload_source)
                     _run_payload_batch(gofile_client, payloads, out_dir)
+                elif initial_bundle_payloads is not None:
+                    _run_payload_batch(gofile_client, initial_bundle_payloads, out_dir)
                 else:
                     _run_url_batch(gofile_client, urls, out_dir, args.password)
             else:
