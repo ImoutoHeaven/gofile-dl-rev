@@ -120,6 +120,12 @@ Payload mode behavior:
 - Retry failed files directly: `python run.py --content-payload-file ./output/failed_files.json -d ./output`
 - Failed file report is flushed immediately as failures occur (not only at end of round)
 
+Metadata transport behavior:
+
+- GoFile metadata requests (`/accounts`, `/dist/js/config.js`, `/contents/{id}`) run through persistent headless Chromium.
+- Browser session/profile state is stored at `${CONFIG_DIR}/.gofile-chrome-profile` (or `~/.cache/gofile-dl/.gofile-chrome-profile` when `CONFIG_DIR` is unset).
+- Direct file transfer links continue using `curl_cffi`.
+
 Download transport behavior:
 
 - File downloads use libcurl backend via `curl_cffi` (no Python `requests` TLS download path)

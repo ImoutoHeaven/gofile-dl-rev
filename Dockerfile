@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install system dependencies without specific versions to avoid compatibility issues
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc python3-dev curl && \
+    apt-get install -y --no-install-recommends gcc python3-dev curl chromium chromium-driver && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +13,7 @@ RUN apt-get update && \
 RUN groupadd -r -g 1000 appuser && useradd -r -g appuser -u 1000 appuser
 
 # Create necessary directories with proper permissions
-RUN mkdir -p /app /data && chown -R appuser:appuser /app /data
+RUN mkdir -p /app /data /config && chown -R appuser:appuser /app /data /config
 
 # Install Python dependencies
 COPY --chown=appuser:appuser requirements.txt .
@@ -26,6 +26,7 @@ COPY --chown=appuser:appuser . .
 ENV PORT=2355 \
     HOST="0.0.0.0" \
     BASE_DIR="/data" \
+    CONFIG_DIR="/config" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

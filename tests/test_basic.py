@@ -31,5 +31,12 @@ class BasicTests(unittest.TestCase):
         self.assertTrue(hasattr(gofile, "download"))
         self.assertTrue(hasattr(gofile, "execute"))
 
+    def test_gofile_has_meta_transport_methods(self):
+        """Test that GoFile exposes browser metadata transport methods"""
+        gofile = GoFile()
+        self.assertTrue(hasattr(gofile, "meta_transport"))
+        self.assertTrue(hasattr(gofile.meta_transport, "request_json"))
+        self.assertTrue(hasattr(gofile.meta_transport, "request_text"))
+
 if __name__ == '__main__':
     unittest.main()

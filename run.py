@@ -11,6 +11,11 @@ import re
 import json
 from typing import Dict, Any, Optional, Callable, Set, List, Tuple
 
+try:
+    from typing import Protocol
+except ImportError:  # Python 3.7
+    from typing_extensions import Protocol
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s][%(funcName)20s()][%(levelname)-8s]: %(message)s",
@@ -35,6 +40,20 @@ AUTH_RETRY_SKIP_STATUSES = {
 }
 DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
 DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
+
+
+class _MetaTransportProtocol(Protocol):
+    def request_json(self, method: str, url: str, headers=None, params=None, timeout=10):
+        raise NotImplementedError
+
+    def request_text(self, method: str, url: str, headers=None, params=None, timeout=10):
+        raise NotImplementedError
+
+
+def build_meta_transport() -> _MetaTransportProtocol:
+    from gofile_browser_client import get_browser_meta_transport
+
+    return get_browser_meta_transport()
 
 
 def get_runtime_config_dir() -> str:
@@ -847,6 +866,7 @@ class GoFile(metaclass=GoFileMeta):
         """Initialize the GoFile client and credential cache settings."""
         self.token: str = ""
         self.wt: str = ""
+        self.meta_transport = build_meta_transport()
         self.failed_files: List[Dict[str, Any]] = []
         self.failed_report_dir: Optional[str] = None
         self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
@@ -1000,7 +1020,11 @@ class GoFile(metaclass=GoFileMeta):
                 return
 
         try:
-            data = requests.post("https://api.gofile.io/accounts", timeout=DEFAULT_TIMEOUT).json()
+            data = self.meta_transport.request_json(
+                "POST",
+                "https://api.gofile.io/accounts",
+                timeout=DEFAULT_TIMEOUT,
+            )
         except Exception as e:
             logger.error(f"Cannot get token: {e}")
             return
@@ -1032,7 +1056,11 @@ class GoFile(metaclass=GoFileMeta):
                 return
 
         try:
-            alljs = requests.get("https://gofile.io/dist/js/config.js", timeout=DEFAULT_TIMEOUT).text
+            alljs = self.meta_transport.request_text(
+                "GET",
+                "https://gofile.io/dist/js/config.js",
+                timeout=DEFAULT_TIMEOUT,
+            )
             if 'appdata.wt = "' in alljs:
                 self.wt = alljs.split('appdata.wt = "')[1].split('"')[0]
                 if self.wt:
@@ -1110,16 +1138,17 @@ class GoFile(metaclass=GoFileMeta):
                 params['password'] = hash_password
             
             try:
-                response = requests.get(
+                response_headers = {
+                    "Authorization": "Bearer " + self.token,
+                    "X-Website-Token": self.wt,
+                }
+                data = self.meta_transport.request_json(
+                    "GET",
                     f"https://api.gofile.io/contents/{content_id}",
-                    headers={
-                        "Authorization": "Bearer " + self.token,
-                        "X-Website-Token": self.wt
-                    },
+                    headers=response_headers,
                     params=params,
-                    timeout=DEFAULT_TIMEOUT
+                    timeout=DEFAULT_TIMEOUT,
                 )
-                data = response.json()
             except Exception as e:
                 logger.error(f"Failed to fetch content {content_id}: {e}")
                 return
