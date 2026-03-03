@@ -377,6 +377,7 @@ def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
     class _FakeCurlResponse:
         def __init__(self):
             self.headers = {"Content-Length": "5"}
+            self.closed = False
 
         def raise_for_status(self):
             return None
@@ -385,12 +386,8 @@ def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
             del chunk_size
             yield b"hello"
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
+        def close(self):
+            self.closed = True
 
     def _requests_get_should_not_run(*_args, **_kwargs):
         raise AssertionError("requests.get download path should not be used")

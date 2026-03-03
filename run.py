@@ -1527,14 +1527,15 @@ class GoFile(metaclass=GoFileMeta):
                 file_dir = os.path.dirname(file)
                 os.makedirs(file_dir, exist_ok=True)
                 size = os.path.getsize(temp) if os.path.exists(temp) else 0
-                with curl_requests.get(
+                response = curl_requests.get(
                     link, headers={
                         "Cookie": f"accountToken={self.token}",
                         "Range": f"bytes={size}-"
                     }, stream=True, timeout=DEFAULT_TIMEOUT
-                ) as r:
-                    r.raise_for_status()
-                    total_size = int(r.headers.get("Content-Length", 0)) + size
+                )
+                try:
+                    response.raise_for_status()
+                    total_size = int(response.headers.get("Content-Length", 0)) + size
                     downloaded = size
                     
                     # Register file with its size information
@@ -1542,7 +1543,7 @@ class GoFile(metaclass=GoFileMeta):
                         file_progress_callback(file, 0, size=total_size)  # Pass size here
                     
                     with open(temp, "ab") as f:
-                        for chunk in r.iter_content(chunk_size=chunk_size):
+                        for chunk in response.iter_content(chunk_size=chunk_size):
                             # Check for pause - if paused, wait until unpaused
                             if pause_callback and pause_callback():
                                 while pause_callback():
@@ -1586,6 +1587,10 @@ class GoFile(metaclass=GoFileMeta):
                     
                     # Download was successful, exit the retry loop
                     return True
+                finally:
+                    close_fn = getattr(response, "close", None)
+                    if callable(close_fn):
+                        close_fn()
                     
             except Exception as e:
                 attempts += 1
