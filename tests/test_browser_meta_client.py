@@ -215,6 +215,52 @@ def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, mon
     assert events == ["uc", "selenium"]
 
 
+def test_ensure_driver_applies_proxy_from_env(tmp_path, monkeypatch):
+    transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
+    captured = {"args": []}
+
+    class _FakeOptions:
+        def __init__(self):
+            self.arguments = []
+
+        def add_argument(self, value):
+            self.arguments.append(value)
+
+    class _FakeChromeDriver:
+        def get(self, _url):
+            return None
+
+        def get_cookies(self):
+            return []
+
+        def execute_script(self, _script):
+            return {"localStorage": {}, "sessionStorage": {}}
+
+        def quit(self):
+            return None
+
+    def _fake_chrome(options=None):
+        assert options is not None
+        captured["args"] = list(options.arguments)
+        return _FakeChromeDriver()
+
+    def _fake_import_module(name):
+        if name == "undetected_chromedriver":
+            raise ImportError("uc missing")
+        if name == "selenium.webdriver":
+            return types.SimpleNamespace(Chrome=_fake_chrome)
+        if name == "selenium.webdriver.chrome.options":
+            return types.SimpleNamespace(Options=_FakeOptions)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setenv("GOFILE_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr(gbc.importlib, "import_module", _fake_import_module)
+
+    transport._ensure_driver()
+
+    assert "--proxy-server=http://127.0.0.1:7890" in captured["args"]
+
+
 def test_ensure_driver_persists_gofile_session_state(tmp_path, monkeypatch):
     transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
 

@@ -63,7 +63,13 @@ def test_execute_uses_meta_transport_for_contents(monkeypatch, tmp_path):
         "Authorization": "Bearer tk",
         "X-Website-Token": "wt",
     }
-    assert seen["params"] == {}
+    assert seen["params"] == {
+        "contentFilter": "",
+        "page": 1,
+        "pageSize": 1000,
+        "sortField": "name",
+        "sortDirection": 1,
+    }
     assert seen["timeout"] == run.DEFAULT_TIMEOUT
 
 
@@ -72,6 +78,7 @@ def test_execute_does_not_force_refresh_on_not_premium(monkeypatch, tmp_path):
     token_force_calls = []
     wt_force_calls = []
     request_calls = {"count": 0}
+    seen_headers = []
     legacy_calls = {"count": 0}
 
     def _fake_update_token(force_refresh=False):
@@ -83,8 +90,9 @@ def test_execute_does_not_force_refresh_on_not_premium(monkeypatch, tmp_path):
         client.wt = "wt"
 
     def _fake_request_json(method, url, headers=None, params=None, timeout=10):
-        del method, url, headers, params, timeout
+        del method, url, params, timeout
         request_calls["count"] += 1
+        seen_headers.append(dict(headers or {}))
         return {"status": "error-notPremium", "data": {}}
 
     def _legacy_get(*_args, **_kwargs):
@@ -98,8 +106,10 @@ def test_execute_does_not_force_refresh_on_not_premium(monkeypatch, tmp_path):
 
     client.execute(dir=str(tmp_path), content_id="abc123")
 
-    assert request_calls["count"] == 1
+    assert request_calls["count"] == 2
     assert legacy_calls["count"] == 0
+    assert seen_headers[0].get("X-Website-Token") == "wt"
+    assert "X-Website-Token" not in seen_headers[1]
     assert True not in token_force_calls
     assert True not in wt_force_calls
 

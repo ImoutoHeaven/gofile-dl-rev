@@ -40,13 +40,31 @@ AUTH_RETRY_SKIP_STATUSES = {
 }
 DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
 DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
+DEFAULT_CONTENTS_PAGE_SIZE = 1000
+NOT_PREMIUM_STATUS = "error-notpremium"
 
 
 class _MetaTransportProtocol(Protocol):
-    def request_json(self, method: str, url: str, headers=None, params=None, timeout=10):
+    def request_json(
+        self,
+        method: str,
+        url: str,
+        headers=None,
+        params=None,
+        timeout=10,
+        credentials: str = "include",
+    ):
         raise NotImplementedError
 
-    def request_text(self, method: str, url: str, headers=None, params=None, timeout=10):
+    def request_text(
+        self,
+        method: str,
+        url: str,
+        headers=None,
+        params=None,
+        timeout=10,
+        credentials: str = "include",
+    ):
         raise NotImplementedError
 
 
@@ -62,6 +80,24 @@ def get_runtime_config_dir() -> str:
     if config_dir:
         return config_dir
     return os.path.join(os.path.expanduser("~"), ".cache", "gofile-dl")
+
+
+def read_proxy_from_env() -> Optional[str]:
+    """Resolve proxy URL from GoFile-specific or standard proxy environment variables."""
+    for env_name in (
+        "GOFILE_DOWNLOAD_PROXY",
+        "GOFILE_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 def normalize_gofile_url(raw_url: str) -> Optional[str]:
@@ -900,10 +936,14 @@ class GoFile(metaclass=GoFileMeta):
     def _get_download_session(self) -> Any:
         """Reuse one curl_cffi session with browser impersonation for all file transfers."""
         if self._download_session is None:
-            self._download_session = curl_requests.Session(
-                impersonate="chrome",
-                default_headers=True,
-            )
+            session_kwargs: Dict[str, Any] = {
+                "impersonate": "chrome",
+                "default_headers": True,
+            }
+            proxy_server = read_proxy_from_env()
+            if proxy_server:
+                session_kwargs["proxy"] = proxy_server
+            self._download_session = curl_requests.Session(**session_kwargs)
         return self._download_session
 
     def clear_failed_files(self) -> None:
@@ -960,6 +1000,29 @@ class GoFile(metaclass=GoFileMeta):
             logger.warning(f"Invalid {env_name} value '{raw_value}', using default {default_value}")
             return default_value
         return max(ttl, 0)
+
+    @staticmethod
+    def _build_contents_params(password: Optional[str] = None) -> Dict[str, Any]:
+        """Mirror GoFile web client query defaults for /contents requests."""
+        params: Dict[str, Any] = {
+            "contentFilter": "",
+            "page": 1,
+            "pageSize": DEFAULT_CONTENTS_PAGE_SIZE,
+            "sortField": "name",
+            "sortDirection": 1,
+        }
+        if password:
+            params["password"] = hashlib.sha256(password.encode()).hexdigest()
+        return params
+
+    def _build_contents_headers(self, include_website_token: bool = True) -> Dict[str, str]:
+        """Build /contents request headers with optional website token."""
+        headers = {
+            "Authorization": "Bearer " + self.token,
+        }
+        if include_website_token and self.wt:
+            headers["X-Website-Token"] = self.wt
+        return headers
 
     def _load_credential_cache(self) -> None:
         """Load cached account token and website token when still fresh."""
@@ -1056,6 +1119,7 @@ class GoFile(metaclass=GoFileMeta):
                 "POST",
                 "https://api.gofile.io/accounts",
                 timeout=DEFAULT_TIMEOUT,
+                credentials="omit",
             )
         except Exception as e:
             logger.error(f"Cannot get token: {e}")
@@ -1163,22 +1227,15 @@ class GoFile(metaclass=GoFileMeta):
             if incremental and tracker is None:
                 tracker = DownloadTracker(dir, content_id, folder_pattern)
             
-            # Build API request with proper parameters
-            params = {}
-            if password:
-                hash_password = hashlib.sha256(password.encode()).hexdigest()
-                params['password'] = hash_password
+            request_params = self._build_contents_params(password=password)
+            request_headers = self._build_contents_headers(include_website_token=True)
             
             try:
-                response_headers = {
-                    "Authorization": "Bearer " + self.token,
-                    "X-Website-Token": self.wt,
-                }
                 data = self.meta_transport.request_json(
                     "GET",
                     f"https://api.gofile.io/contents/{content_id}",
-                    headers=response_headers,
-                    params=params,
+                    headers=request_headers,
+                    params=request_params,
                     timeout=DEFAULT_TIMEOUT,
                 )
             except Exception as e:
@@ -1186,36 +1243,64 @@ class GoFile(metaclass=GoFileMeta):
                 return
             if data.get("status") != "ok":
                 status, details = parse_api_error_details(data)
-                if auth_retry and should_refresh_auth(status):
-                    logger.warning(
-                        f"API error [{status}], forcing credential refresh and retrying once: {details}"
-                    )
-                    self.update_token(force_refresh=True)
-                    self.update_wt(force_refresh=True)
-                    self.execute(
-                        dir=dir,
-                        content_id=content_id,
-                        password=password,
-                        progress_callback=progress_callback,
-                        cancel_event=cancel_event,
-                        name_callback=name_callback,
-                        overall_progress_callback=overall_progress_callback,
-                        start_time=start_time,
-                        file_progress_callback=file_progress_callback,
-                        pause_callback=pause_callback,
-                        throttle_speed=throttle_speed,
-                        retry_attempts=retry_attempts,
-                        strip_emojis=strip_emojis,
-                        incremental=incremental,
-                        tracker=tracker,
-                        folder_pattern=folder_pattern,
-                        auth_retry=False,
-                        failed_base_dir=failed_base_dir,
-                    )
-                    return
 
-                logger.error(f"API error [{status}]: {details}")
-                return
+                if (
+                    auth_retry
+                    and status.strip().lower() == NOT_PREMIUM_STATUS
+                    and "X-Website-Token" in request_headers
+                ):
+                    logger.warning(
+                        "API error [error-notPremium], retrying once without X-Website-Token"
+                    )
+                    try:
+                        data = self.meta_transport.request_json(
+                            "GET",
+                            f"https://api.gofile.io/contents/{content_id}",
+                            headers=self._build_contents_headers(include_website_token=False),
+                            params=request_params,
+                            timeout=DEFAULT_TIMEOUT,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to fetch content {content_id} without website token: {e}"
+                        )
+                        return
+                    if data.get("status") == "ok":
+                        status = "ok"
+                    else:
+                        status, details = parse_api_error_details(data)
+
+                if data.get("status") != "ok":
+                    if auth_retry and should_refresh_auth(status):
+                        logger.warning(
+                            f"API error [{status}], forcing credential refresh and retrying once: {details}"
+                        )
+                        self.update_token(force_refresh=True)
+                        self.update_wt(force_refresh=True)
+                        self.execute(
+                            dir=dir,
+                            content_id=content_id,
+                            password=password,
+                            progress_callback=progress_callback,
+                            cancel_event=cancel_event,
+                            name_callback=name_callback,
+                            overall_progress_callback=overall_progress_callback,
+                            start_time=start_time,
+                            file_progress_callback=file_progress_callback,
+                            pause_callback=pause_callback,
+                            throttle_speed=throttle_speed,
+                            retry_attempts=retry_attempts,
+                            strip_emojis=strip_emojis,
+                            incremental=incremental,
+                            tracker=tracker,
+                            folder_pattern=folder_pattern,
+                            auth_retry=False,
+                            failed_base_dir=failed_base_dir,
+                        )
+                        return
+
+                    logger.error(f"API error [{status}]: {details}")
+                    return
             if data["data"].get("passwordStatus", "passwordOk") != "passwordOk":
                 logger.error("Invalid password: %s", data["data"].get("passwordStatus"))
                 return

@@ -47,12 +47,20 @@ def test_update_token_force_refresh_requests_new_token(monkeypatch, tmp_path):
     client = _fresh_client(tmp_path)
     calls = {"count": 0}
 
-    def _fake_request_json(method, url, headers=None, params=None, timeout=10):
+    def _fake_request_json(
+        method,
+        url,
+        headers=None,
+        params=None,
+        timeout=10,
+        credentials="include",
+    ):
         del headers, params
         calls["count"] += 1
         assert method == "POST"
         assert url == "https://api.gofile.io/accounts"
         assert timeout == run.DEFAULT_TIMEOUT
+        assert credentials == "omit"
         return {"status": "ok", "data": {"token": "fresh-token"}}
 
     monkeypatch.setattr(client.meta_transport, "request_json", _fake_request_json)

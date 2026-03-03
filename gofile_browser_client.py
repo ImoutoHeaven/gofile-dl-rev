@@ -8,6 +8,23 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 
+def _read_proxy_from_env() -> Optional[str]:
+    for env_name in (
+        "GOFILE_BROWSER_PROXY",
+        "GOFILE_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 class BrowserMetaTransport:
     def __init__(self, profile_dir: str) -> None:
         self.profile_dir = profile_dir
@@ -93,6 +110,9 @@ class BrowserMetaTransport:
         options.add_argument(f"--user-data-dir={self.profile_dir}")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        proxy_server = _read_proxy_from_env()
+        if proxy_server:
+            options.add_argument(f"--proxy-server={proxy_server}")
 
     def _create_browser_driver(self) -> Any:
         uc_error: Optional[Exception] = None
@@ -171,6 +191,7 @@ class BrowserMetaTransport:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeout: int = 10,
+        credentials: str = "include",
     ) -> str:
         request_url = self._build_url(url, params)
         with self._lock:
@@ -183,14 +204,14 @@ class BrowserMetaTransport:
 
             payload = self._driver.execute_async_script(
                 """
-                const [url, method, headers, timeoutMs, done] = arguments;
+                const [url, method, headers, timeoutMs, credentialsMode, done] = arguments;
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), timeoutMs);
 
                 fetch(url, {
                     method: method,
                     headers: headers || {},
-                    credentials: 'include',
+                    credentials: credentialsMode || 'include',
                     signal: controller.signal
                 })
                     .then(async (resp) => {
@@ -208,6 +229,7 @@ class BrowserMetaTransport:
                 method.upper(),
                 headers or {},
                 int(timeout * 1000),
+                credentials,
             )
 
         result = json.loads(payload)
@@ -222,9 +244,17 @@ class BrowserMetaTransport:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeout: int = 10,
+        credentials: str = "include",
     ) -> Dict[str, Any]:
         return json.loads(
-            self.request_text(method, url, headers=headers, params=params, timeout=timeout)
+            self.request_text(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+                credentials=credentials,
+            )
         )
 
 

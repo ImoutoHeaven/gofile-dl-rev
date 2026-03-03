@@ -446,3 +446,39 @@ def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
     assert observed_get_kwargs.get("impersonate") is None
     assert observed_get_kwargs.get("cookies") == {"accountToken": "token-123"}
     assert output_path.read_bytes() == b"hello"
+
+
+def test_download_session_uses_proxy_env(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    observed_session_kwargs = {}
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {"Content-Length": "2"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            yield b"ok"
+
+        def close(self):
+            return None
+
+    class _FakeCurlSession:
+        def __init__(self, **kwargs):
+            observed_session_kwargs.update(kwargs)
+
+        def get(self, *_args, **_kwargs):
+            return _FakeCurlResponse()
+
+    monkeypatch.setenv("GOFILE_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+
+    client = run.GoFile()
+    output_path = tmp_path / "curl" / "proxy.bin"
+    ok = client.download("https://cdn.example/file", str(output_path), retry_attempts=0)
+
+    assert ok is True
+    assert observed_session_kwargs.get("proxy") == "http://127.0.0.1:7890"

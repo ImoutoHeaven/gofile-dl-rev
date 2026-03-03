@@ -365,8 +365,9 @@ Example health check response:
 
 5. **GoFile download errors**
    - Error "Cannot get wt": GoFile may have updated their JavaScript structure. Check for application updates.
-   - Error "API error: error-notPremium": Ensure you're using the latest version with `X-Website-Token`
-     header support
+   - Error "API error: error-notPremium": Ensure you're using the latest version (it now retries `/contents`
+     without `X-Website-Token` once). If your IP is blocked, set a proxy for headless metadata requests,
+     e.g. `GOFILE_PROXY=http://127.0.0.1:7890`.
    - Nested folders not downloading: Verify you're providing the top-level folder URL, not individual file links
    - Special characters in filenames: These are automatically sanitized - check the `downloads` folder for the
      converted names
