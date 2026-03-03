@@ -2117,8 +2117,8 @@ class GoFile(metaclass=GoFileMeta):
                                         bytes_since_last_check = 0
                                         last_check_time = time.time()
                     
-                    # Rename temp file to final file when download is complete
-                    os.rename(temp, file)
+                    # Replace target atomically so Windows does not fail when destination exists.
+                    os.replace(temp, file)
                     if file_progress_callback:
                         file_progress_callback(file, 100, size=reported_size)
                     logger.info(f"Downloaded: {file} ({link})")

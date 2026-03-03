@@ -989,3 +989,100 @@ def test_download_handles_missing_content_length_without_division_by_zero(monkey
     assert ok is True
     assert observed_progress
     assert output_path.read_bytes() == b"hello"
+
+
+def test_download_overwrites_existing_file_when_rename_hits_windows_exists_error(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {"Content-Length": "5"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            yield b"hello"
+
+        def close(self):
+            return None
+
+    class _FakeCurlSession:
+        def __init__(self, **_kwargs):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return _FakeCurlResponse()
+
+    real_replace = run.os.replace
+    replace_calls = []
+
+    def _fake_rename(src, dst):
+        if run.os.path.exists(dst):
+            raise FileExistsError(183, "file exists", dst)
+        return None
+
+    def _fake_replace(src, dst):
+        replace_calls.append((src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run.curl_requests, "Session", _FakeCurlSession)
+    monkeypatch.setattr(run.os, "rename", _fake_rename)
+    monkeypatch.setattr(run.os, "replace", _fake_replace)
+
+    client = run.GoFile()
+    output_path = tmp_path / "curl" / "existing.bin"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"old")
+
+    ok = client.download("https://cdn.example/file", str(output_path), retry_attempts=0)
+
+    assert ok is True
+    assert replace_calls
+    assert output_path.read_bytes() == b"hello"
+
+
+def test_record_failed_file_keeps_report_snapshots_ordered_under_concurrency(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.set_failed_report_dir(str(tmp_path))
+
+    observed_lengths = []
+    observed_lock = threading.Lock()
+
+    def _fake_write_failed_files_report(failed_files, out_dir):
+        del out_dir
+        # If writes happen outside the failed-files lock, this delay can reorder snapshots.
+        time.sleep((32 - len(failed_files)) * 0.0005)
+        with observed_lock:
+            observed_lengths.append(len(failed_files))
+        return "ignored"
+
+    monkeypatch.setattr(run, "write_failed_files_report", _fake_write_failed_files_report)
+
+    worker_threads = []
+    total_failures = 16
+
+    for index in range(total_failures):
+        file_path = tmp_path / f"failed-{index}.bin"
+        thread = threading.Thread(
+            target=client._record_failed_file,
+            kwargs={
+                "link": f"https://cdn.example/{index}",
+                "file_path": str(file_path),
+                "error": "network error",
+                "base_dir": str(tmp_path),
+            },
+        )
+        worker_threads.append(thread)
+
+    for thread in worker_threads:
+        thread.start()
+    for thread in worker_threads:
+        thread.join()
+
+    assert len(client.failed_files) == total_failures
+    assert observed_lengths
+    assert observed_lengths == sorted(observed_lengths)
+    assert observed_lengths[-1] == total_failures
