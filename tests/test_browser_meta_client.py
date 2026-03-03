@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import time
+import types
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -108,3 +109,86 @@ def test_request_text_warms_gofile_origin_before_first_fetch(tmp_path, monkeypat
     assert response_text == "ok"
     assert call_order[0] == ("get", "https://gofile.io/")
     assert call_order[1][0] == "fetch"
+
+
+def test_ensure_driver_falls_back_to_selenium_when_uc_missing(tmp_path, monkeypatch):
+    transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
+    captured = {"args": []}
+
+    class _FakeOptions:
+        def __init__(self):
+            self.arguments = []
+
+        def add_argument(self, value):
+            self.arguments.append(value)
+
+    class _FakeChromeDriver:
+        def quit(self):
+            return None
+
+    def _fake_chrome(options=None):
+        assert options is not None
+        captured["args"] = list(options.arguments)
+        return _FakeChromeDriver()
+
+    def _fake_import_module(name):
+        if name == "undetected_chromedriver":
+            raise ImportError("uc missing")
+        if name == "selenium.webdriver":
+            return types.SimpleNamespace(Chrome=_fake_chrome)
+        if name == "selenium.webdriver.chrome.options":
+            return types.SimpleNamespace(Options=_FakeOptions)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(gbc.importlib, "import_module", _fake_import_module)
+
+    transport._ensure_driver()
+
+    assert transport._driver is not None
+    assert "--headless=new" in captured["args"]
+    assert f"--user-data-dir={tmp_path}" in captured["args"]
+
+
+def test_ensure_driver_falls_back_to_selenium_when_uc_launch_fails(tmp_path, monkeypatch):
+    transport = gbc.BrowserMetaTransport(profile_dir=str(tmp_path))
+    events = []
+
+    class _FakeOptions:
+        def __init__(self):
+            self.arguments = []
+
+        def add_argument(self, value):
+            self.arguments.append(value)
+
+    class _FakeChromeDriver:
+        def quit(self):
+            return None
+
+    def _fake_uc_chrome(options=None):
+        assert options is not None
+        events.append("uc")
+        raise RuntimeError("session not created")
+
+    def _fake_selenium_chrome(options=None):
+        assert options is not None
+        events.append("selenium")
+        return _FakeChromeDriver()
+
+    def _fake_import_module(name):
+        if name == "undetected_chromedriver":
+            return types.SimpleNamespace(
+                ChromeOptions=_FakeOptions,
+                Chrome=_fake_uc_chrome,
+            )
+        if name == "selenium.webdriver":
+            return types.SimpleNamespace(Chrome=_fake_selenium_chrome)
+        if name == "selenium.webdriver.chrome.options":
+            return types.SimpleNamespace(Options=_FakeOptions)
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(gbc.importlib, "import_module", _fake_import_module)
+
+    transport._ensure_driver()
+
+    assert transport._driver is not None
+    assert events == ["uc", "selenium"]

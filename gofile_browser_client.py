@@ -1,4 +1,5 @@
 import atexit
+import importlib
 import json
 import os
 import threading
@@ -17,24 +18,58 @@ class BrowserMetaTransport:
         if self._driver is not None:
             return
 
-        try:
-            import undetected_chromedriver as uc
-        except ImportError as exc:
-            raise RuntimeError(
-                "undetected_chromedriver is required for BrowserMetaTransport"
-            ) from exc
-
         os.makedirs(self.profile_dir, exist_ok=True)
+        self._driver = self._create_browser_driver()
+        self._origin_ready = False
+        atexit.register(self.close)
 
-        options = uc.ChromeOptions()
+    def _configure_browser_options(self, options: Any) -> None:
         options.add_argument("--headless=new")
         options.add_argument(f"--user-data-dir={self.profile_dir}")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
 
-        self._driver = uc.Chrome(options=options)
-        self._origin_ready = False
-        atexit.register(self.close)
+    def _create_browser_driver(self) -> Any:
+        uc_error: Optional[Exception] = None
+
+        try:
+            uc = importlib.import_module("undetected_chromedriver")
+        except ImportError:
+            uc = None
+
+        if uc is not None:
+            options = uc.ChromeOptions()
+            self._configure_browser_options(options)
+            try:
+                return uc.Chrome(options=options)
+            except Exception as exc:
+                uc_error = exc
+
+        try:
+            webdriver_module = importlib.import_module("selenium.webdriver")
+            options_module = importlib.import_module("selenium.webdriver.chrome.options")
+        except ImportError as exc:
+            if uc_error is not None:
+                raise RuntimeError(
+                    "undetected_chromedriver failed and selenium is unavailable "
+                    "(install dependencies with `pip install -r requirements.txt`)"
+                ) from uc_error
+            raise RuntimeError(
+                "BrowserMetaTransport requires undetected_chromedriver or selenium "
+                "(install dependencies with `pip install -r requirements.txt`)"
+            ) from exc
+
+        options = options_module.Options()
+        self._configure_browser_options(options)
+        try:
+            return webdriver_module.Chrome(options=options)
+        except Exception as exc:
+            if uc_error is not None:
+                raise RuntimeError(
+                    "Failed to initialize browser driver via both undetected_chromedriver "
+                    "and selenium"
+                ) from exc
+            raise
 
     def _build_url(self, url: str, params: Optional[Dict[str, Any]]) -> str:
         if not params:
