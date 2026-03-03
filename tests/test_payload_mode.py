@@ -304,3 +304,102 @@ def test_main_writes_failed_files_json_parseable_for_payload_retry(tmp_path):
     assert retry_jobs == [
         ("https://cdn.example/fail", os.path.join(str(tmp_path), "Root", "B.txt"))
     ]
+
+
+def test_execute_payload_skips_already_downloaded_file_by_size_md5(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.failed_files = []
+
+    file_dir = tmp_path / "Root"
+    file_dir.mkdir(parents=True, exist_ok=True)
+    file_path = file_dir / "A.txt"
+    file_path.write_bytes(b"hello-world")
+
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "A.txt",
+            "relativePath": "Root/A.txt",
+            "link": "https://cdn.example/a",
+            "size": 11,
+            "md5": "2095312189753de6ad47dfe20cbe97ec",
+        },
+    }
+
+    def _unexpected_download(*_args, **_kwargs):
+        raise AssertionError("download should be skipped for already downloaded file")
+
+    monkeypatch.setattr(client, "download", _unexpected_download)
+
+    client.execute_payload(dir=str(tmp_path), payload=payload)
+
+    assert client.failed_files == []
+
+
+def test_execute_payload_flushes_failed_report_immediately(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+    client.failed_files = []
+    client.failed_report_dir = str(tmp_path)
+
+    def _always_fail(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(client, "download", _always_fail)
+
+    payload = {
+        "status": "ok",
+        "data": {
+            "type": "file",
+            "name": "B.txt",
+            "relativePath": "Root/B.txt",
+            "link": "https://cdn.example/fail",
+            "size": 12,
+            "md5": "d41d8cd98f00b204e9800998ecf8427e",
+        },
+    }
+
+    client.execute_payload(dir=str(tmp_path), payload=payload)
+
+    failed_path = tmp_path / "failed_files.json"
+    assert failed_path.exists()
+    failed_payloads = run.load_content_payloads(str(failed_path))
+    assert len(failed_payloads) == 1
+    assert failed_payloads[0]["relativePath"] == "Root/B.txt"
+
+
+def test_download_uses_libcurl_backend(monkeypatch, tmp_path):
+    run.GoFileMeta._instances.clear()
+    client = run.GoFile()
+
+    class _FakeCurlResponse:
+        def __init__(self):
+            self.headers = {"Content-Length": "5"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=8192):
+            del chunk_size
+            yield b"hello"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+    def _requests_get_should_not_run(*_args, **_kwargs):
+        raise AssertionError("requests.get download path should not be used")
+
+    monkeypatch.setattr(run.requests, "get", _requests_get_should_not_run)
+    monkeypatch.setattr(run.curl_requests, "get", lambda *_args, **_kwargs: _FakeCurlResponse())
+
+    output_path = tmp_path / "curl" / "ok.bin"
+    ok = client.download("https://cdn.example/file", str(output_path), retry_attempts=0)
+
+    assert ok is True
+    assert output_path.read_bytes() == b"hello"

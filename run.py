@@ -4,6 +4,7 @@ import os
 import sys
 from pathvalidate import sanitize_filename
 import requests
+from curl_cffi import requests as curl_requests
 import hashlib
 import time
 import re
@@ -322,6 +323,130 @@ def _walk_payload_node(
     jobs.append((link, file_path))
 
 
+def _parse_optional_int(value: Any) -> Optional[int]:
+    """Parse optional integer metadata values like payload `size`."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.isdigit():
+            parsed = int(cleaned)
+            return parsed if parsed >= 0 else None
+    return None
+
+
+def _walk_payload_items(
+    node: Dict[str, Any],
+    current_dir: str,
+    items: List[Dict[str, Any]],
+    strip_emojis: bool,
+    node_id: str = "",
+) -> None:
+    """Recursively walk payload nodes and keep file metadata for download decisions."""
+    node_type = str(node.get("type", "file")).lower()
+
+    if node_type == "folder":
+        fallback_folder_name = f"folder_{node_id[:8]}" if node_id else "folder"
+        folder_name = _normalize_payload_name(
+            node.get("name"), fallback_folder_name, strip_emojis
+        )
+        folder_path = os.path.join(current_dir, sanitize_filename(folder_name))
+
+        children = node.get("children")
+        if not isinstance(children, dict) or not children:
+            children = node.get("contents")
+
+        if isinstance(children, dict):
+            for child_id, child in children.items():
+                if not isinstance(child, dict):
+                    continue
+                _walk_payload_items(
+                    node=child,
+                    current_dir=folder_path,
+                    items=items,
+                    strip_emojis=strip_emojis,
+                    node_id=str(child_id),
+                )
+            return
+
+        logger.warning(
+            "Payload folder '%s' has no embedded children; skipping nested traversal",
+            folder_name,
+        )
+        return
+
+    link = node.get("link")
+    if not isinstance(link, str) or not link.strip():
+        logger.warning("Skipping payload file without direct link")
+        return
+
+    fallback_file_name = f"file_{node_id[:8]}" if node_id else "file"
+    file_name = _normalize_payload_name(node.get("name"), fallback_file_name, strip_emojis)
+
+    relative_path = node.get("relativePath")
+    if isinstance(relative_path, str) and relative_path.strip():
+        path_parts: List[str] = []
+        for raw_part in relative_path.replace("\\", "/").split("/"):
+            part = raw_part.strip()
+            if not part or part in (".", ".."):
+                continue
+            safe_part = sanitize_filename(part)
+            if safe_part:
+                path_parts.append(safe_part)
+        if path_parts:
+            file_path = os.path.join(current_dir, *path_parts)
+        else:
+            file_path = os.path.join(current_dir, sanitize_filename(file_name))
+    else:
+        file_path = os.path.join(current_dir, sanitize_filename(file_name))
+
+    item: Dict[str, Any] = {
+        "link": link,
+        "file_path": file_path,
+    }
+
+    expected_size = _parse_optional_int(node.get("size"))
+    if expected_size is not None:
+        item["size"] = expected_size
+
+    md5_value = node.get("md5")
+    if isinstance(md5_value, str) and md5_value.strip():
+        item["md5"] = md5_value.strip().lower()
+
+    items.append(item)
+
+
+def collect_download_items_from_payload(
+    payload: Dict[str, Any],
+    base_dir: str,
+    strip_emojis: bool = False,
+) -> List[Dict[str, Any]]:
+    """Convert payload into download items with file metadata."""
+    root_node: Any = payload
+    if "status" in payload:
+        status, details = parse_api_error_details(payload)
+        if status != "ok":
+            raise ValueError(f"Payload status is '{status}': {details}")
+        root_node = payload.get("data")
+
+    if not isinstance(root_node, dict):
+        raise ValueError("Payload missing root content object in 'data'")
+
+    items: List[Dict[str, Any]] = []
+    _walk_payload_items(
+        node=root_node,
+        current_dir=base_dir,
+        items=items,
+        strip_emojis=strip_emojis,
+    )
+    return items
+
+
 def collect_download_jobs_from_payload(
     payload: Dict[str, Any],
     base_dir: str,
@@ -333,24 +458,12 @@ def collect_download_jobs_from_payload(
     Accepts either the full API response shape (`{"status": "ok", "data": {...}}`)
     or a direct content node object (`{"type": "folder"|"file", ...}`).
     """
-    root_node: Any = payload
-    if "status" in payload:
-        status, details = parse_api_error_details(payload)
-        if status != "ok":
-            raise ValueError(f"Payload status is '{status}': {details}")
-        root_node = payload.get("data")
-
-    if not isinstance(root_node, dict):
-        raise ValueError("Payload missing root content object in 'data'")
-
-    jobs: List[Tuple[str, str]] = []
-    _walk_payload_node(
-        node=root_node,
-        current_dir=base_dir,
-        jobs=jobs,
+    items = collect_download_items_from_payload(
+        payload=payload,
+        base_dir=base_dir,
         strip_emojis=strip_emojis,
     )
-    return jobs
+    return [(item["link"], item["file_path"]) for item in items]
 
 
 def write_failed_files_report(failed_files: List[Dict[str, Any]], out_dir: str) -> Optional[str]:
@@ -431,19 +544,37 @@ def _run_payload_batch(
                 ),
             )
         else:
-            jobs = collect_download_jobs_from_payload(payload, base_dir=out_dir)
-            for link, file_path in jobs:
+            items = collect_download_items_from_payload(payload, base_dir=out_dir)
+            for item in items:
+                link = item["link"]
+                file_path = item["file_path"]
+                expected_size = item.get("size")
+                expected_md5 = item.get("md5")
+
+                if is_payload_file_already_downloaded(
+                    file_path,
+                    expected_size=expected_size,
+                    expected_md5=expected_md5,
+                ):
+                    logger.info(f"Skipping already downloaded payload file: {file_path}")
+                    continue
+
                 downloaded = gofile_client.download(link, file_path)
                 if downloaded is False and hasattr(gofile_client, "failed_files"):
-                    gofile_client.failed_files.append(
-                        {
-                            "type": "file",
-                            "name": os.path.basename(file_path),
-                            "link": link,
-                            "relativePath": os.path.relpath(file_path, out_dir).replace(os.sep, "/"),
-                            "error": "download failed after retries",
-                        }
-                    )
+                    failed_entry: Dict[str, Any] = {
+                        "type": "file",
+                        "name": os.path.basename(file_path),
+                        "link": link,
+                        "relativePath": os.path.relpath(file_path, out_dir).replace(os.sep, "/"),
+                        "error": "download failed after retries",
+                    }
+                    if expected_size is not None:
+                        failed_entry["size"] = expected_size
+                    if expected_md5:
+                        failed_entry["md5"] = expected_md5
+                    gofile_client.failed_files.append(failed_entry)
+                    if hasattr(gofile_client, "failed_report_dir"):
+                        write_failed_files_report(gofile_client.failed_files, out_dir)
 
 
 def _run_url_batch(
@@ -468,6 +599,46 @@ def _run_url_batch(
                 f"File {f} progress: {p}%"
             ),
         )
+
+
+def compute_file_md5(file_path: str, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """Compute file md5 checksum for payload-based integrity checks."""
+    try:
+        md5_hasher = hashlib.md5()
+        with open(file_path, "rb") as file_obj:
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+                md5_hasher.update(chunk)
+        return md5_hasher.hexdigest()
+    except OSError:
+        return None
+
+
+def is_payload_file_already_downloaded(
+    file_path: str,
+    expected_size: Optional[int] = None,
+    expected_md5: Optional[str] = None,
+) -> bool:
+    """Check whether an existing local file matches payload metadata and can be skipped."""
+    if not os.path.isfile(file_path):
+        return False
+
+    if expected_size is not None:
+        try:
+            if os.path.getsize(file_path) != expected_size:
+                return False
+        except OSError:
+            return False
+
+    if expected_md5:
+        local_md5 = compute_file_md5(file_path)
+        if not local_md5:
+            return False
+        return local_md5.lower() == expected_md5.lower()
+
+    return True
 
 def strip_emojis_func(text: str) -> str:
     """
@@ -677,6 +848,7 @@ class GoFile(metaclass=GoFileMeta):
         self.token: str = ""
         self.wt: str = ""
         self.failed_files: List[Dict[str, Any]] = []
+        self.failed_report_dir: Optional[str] = None
         self.token_cache_ttl = self._read_ttl_env("GOFILE_TOKEN_CACHE_TTL", DEFAULT_TOKEN_CACHE_TTL)
         self.wt_cache_ttl = self._read_ttl_env("GOFILE_WT_CACHE_TTL", DEFAULT_WT_CACHE_TTL)
         self.cache_file = os.path.join(get_runtime_config_dir(), ".gofile_api_cache.json")
@@ -686,7 +858,19 @@ class GoFile(metaclass=GoFileMeta):
         """Reset in-memory failed download records for a new run."""
         self.failed_files = []
 
-    def _record_failed_file(self, link: str, file_path: str, error: str, base_dir: str) -> None:
+    def set_failed_report_dir(self, out_dir: str) -> None:
+        """Configure output directory used for immediate failed_files flush."""
+        self.failed_report_dir = out_dir
+
+    def _record_failed_file(
+        self,
+        link: str,
+        file_path: str,
+        error: str,
+        base_dir: str,
+        expected_size: Optional[int] = None,
+        expected_md5: Optional[str] = None,
+    ) -> None:
         """Store failed file as payload-compatible entry for retry."""
         try:
             relative_path = os.path.relpath(file_path, base_dir)
@@ -696,14 +880,21 @@ class GoFile(metaclass=GoFileMeta):
         if relative_path.startswith(".."):
             relative_path = os.path.basename(file_path)
 
-        entry = {
+        entry: Dict[str, Any] = {
             "type": "file",
             "name": os.path.basename(file_path),
             "link": link,
             "relativePath": relative_path.replace(os.sep, "/"),
             "error": error,
         }
+        if expected_size is not None:
+            entry["size"] = expected_size
+        if expected_md5:
+            entry["md5"] = expected_md5.lower()
         self.failed_files.append(entry)
+
+        if self.failed_report_dir:
+            write_failed_files_report(self.failed_files, self.failed_report_dir)
 
     @staticmethod
     def _read_ttl_env(env_name: str, default_value: int) -> int:
@@ -1081,7 +1272,9 @@ class GoFile(metaclass=GoFileMeta):
                             
                             file_path = os.path.join(folder_path, sanitize_filename(filename))
                             link = child.get("link", "")
-                            
+                            child_size = _parse_optional_int(child.get("size"))
+                            child_md5 = child.get("md5") if isinstance(child.get("md5"), str) else None
+                              
                             if not link:
                                 logger.error(f"No download link for file: {filename}")
                                 self._record_failed_file(
@@ -1089,6 +1282,8 @@ class GoFile(metaclass=GoFileMeta):
                                     file_path=file_path,
                                     error="missing direct download link",
                                     base_dir=failed_base_dir,
+                                    expected_size=child_size,
+                                    expected_md5=child_md5,
                                 )
                                 files_completed += 1.0
                                 continue
@@ -1121,6 +1316,8 @@ class GoFile(metaclass=GoFileMeta):
                                     file_path=file_path,
                                     error="download failed after retries",
                                     base_dir=failed_base_dir,
+                                    expected_size=child_size,
+                                    expected_md5=child_md5,
                                 )
                              
                             files_completed += 1.0
@@ -1155,6 +1352,8 @@ class GoFile(metaclass=GoFileMeta):
                 
                 file_path = os.path.join(dir, sanitize_filename(filename))
                 link = data["data"]["link"]
+                file_size = _parse_optional_int(data["data"].get("size"))
+                file_md5 = data["data"].get("md5") if isinstance(data["data"].get("md5"), str) else None
                 if callable(name_callback):
                     name_callback(sanitize_filename(filename))
                 if callable(file_progress_callback):
@@ -1178,6 +1377,8 @@ class GoFile(metaclass=GoFileMeta):
                         file_path=file_path,
                         error="download failed after retries",
                         base_dir=failed_base_dir,
+                        expected_size=file_size,
+                        expected_md5=file_md5,
                     )
         elif url is not None:
             normalized_url = normalize_gofile_url(url)
@@ -1223,16 +1424,34 @@ class GoFile(metaclass=GoFileMeta):
         strip_emojis: bool = False,
     ) -> None:
         """Download files directly from a pre-fetched content payload."""
-        jobs = collect_download_jobs_from_payload(payload, base_dir=dir, strip_emojis=strip_emojis)
-        if not jobs:
+        items = collect_download_items_from_payload(payload, base_dir=dir, strip_emojis=strip_emojis)
+        if not items:
             logger.warning("No downloadable links found in provided payload")
             return
 
-        total_jobs = len(jobs)
-        for index, (link, file_path) in enumerate(jobs, start=1):
+        total_jobs = len(items)
+        for index, item in enumerate(items, start=1):
             if cancel_event and cancel_event.is_set():
                 logger.info("Payload download cancelled")
                 break
+
+            link = item["link"]
+            file_path = item["file_path"]
+            expected_size = item.get("size")
+            expected_md5 = item.get("md5")
+
+            if is_payload_file_already_downloaded(
+                file_path,
+                expected_size=expected_size,
+                expected_md5=expected_md5,
+            ):
+                logger.info(f"Skipping already downloaded payload file: {file_path}")
+                if callable(file_progress_callback):
+                    file_progress_callback(file_path, 100)
+                if callable(overall_progress_callback):
+                    overall_percent = int(index * 100 / total_jobs)
+                    overall_progress_callback(overall_percent, "payload")
+                continue
 
             logger.info(f"Downloading payload file {index}/{total_jobs}: {file_path}")
             if callable(file_progress_callback):
@@ -1258,6 +1477,8 @@ class GoFile(metaclass=GoFileMeta):
                     file_path=file_path,
                     error="download failed after retries",
                     base_dir=dir,
+                    expected_size=expected_size,
+                    expected_md5=expected_md5,
                 )
 
             if callable(overall_progress_callback):
@@ -1306,7 +1527,7 @@ class GoFile(metaclass=GoFileMeta):
                 file_dir = os.path.dirname(file)
                 os.makedirs(file_dir, exist_ok=True)
                 size = os.path.getsize(temp) if os.path.exists(temp) else 0
-                with requests.get(
+                with curl_requests.get(
                     link, headers={
                         "Cookie": f"accountToken={self.token}",
                         "Range": f"bytes={size}-"
@@ -1427,6 +1648,11 @@ def main(
     out_dir = args.dir if args.dir is not None else "./output"
 
     gofile_client = gofile_factory()
+    if hasattr(gofile_client, "set_failed_report_dir"):
+        gofile_client.set_failed_report_dir(out_dir)
+    elif hasattr(gofile_client, "failed_report_dir"):
+        gofile_client.failed_report_dir = out_dir
+
     manual_account_token = None
     if args.account_token:
         manual_account_token = extract_account_token(args.account_token)

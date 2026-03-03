@@ -114,9 +114,16 @@ Payload mode behavior:
 - Extracts direct `link` values recursively and downloads without calling `/contents` again
 - Useful when `/contents` endpoint is rate-limited from your current IP
 - Supports single JSON object, JSON object array, or JSON Lines batch input
+- Automatically skips already-downloaded files when payload metadata matches (`size`/`md5`)
 - Failed downloads are written to `failed_files.json` in the output directory
 - `failed_files.json` is payload-retry compatible (includes `type=file`, `link`, `relativePath`)
 - Retry failed files directly: `python run.py --content-payload-file ./output/failed_files.json -d ./output`
+- Failed file report is flushed immediately as failures occur (not only at end of round)
+
+Download transport behavior:
+
+- File downloads use libcurl backend via `curl_cffi` (no Python `requests` TLS download path)
+- This improves resilience for unstable GoFile CDN TLS edges (e.g. intermittent EOF/SSL aborts)
 
 Retry loop behavior:
 
