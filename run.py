@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import sys
 from pathvalidate import sanitize_filename
 import requests
 import hashlib
@@ -19,6 +20,18 @@ logger = logging.getLogger("GoFile")
 DEFAULT_TIMEOUT = 10  # 10 seconds
 GOFILE_URL_PATTERN = re.compile(r"^https?://gofile\.io/d/([A-Za-z0-9]+)(?:/)?$")
 ACCOUNT_TOKEN_PATTERN = re.compile(r"data\.token\s*[:=]\s*['\"]?([^'\"\s,}]+)")
+AUTH_RETRY_EXACT_STATUSES = {
+    "error-notauthenticated",
+    "error-invalidtoken",
+    "error-badtoken",
+    "error-invalidaccounttoken",
+    "error-invalidwebsitetoken",
+    "error-authrequired",
+}
+AUTH_RETRY_SKIP_STATUSES = {
+    "error-notpremium",
+    "error-ratelimit",
+}
 DEFAULT_TOKEN_CACHE_TTL = 12 * 60 * 60  # 12 hours
 DEFAULT_WT_CACHE_TTL = 60 * 60  # 1 hour
 
@@ -70,6 +83,48 @@ def extract_account_token(raw_token: str) -> Optional[str]:
     return cleaned
 
 
+def parse_api_error_details(payload: Any) -> Tuple[str, str]:
+    """Extract API status and readable details from a GoFile response payload."""
+    if not isinstance(payload, dict):
+        return "error-unknown", str(payload)
+
+    status = str(payload.get("status", "error-unknown"))
+    details: List[str] = []
+
+    for key in ("message", "error"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            details.append(value.strip())
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("message", "reason", "error", "details"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                details.append(value.strip())
+        if "retryAfter" in data:
+            details.append(f"retryAfter={data.get('retryAfter')}")
+    elif data not in (None, ""):
+        details.append(f"data={data}")
+
+    if not details:
+        details.append("no additional details")
+
+    return status, "; ".join(details)
+
+
+def should_refresh_auth(status: str) -> bool:
+    """Decide whether an API error likely needs credential refresh."""
+    normalized = status.strip().lower()
+    if not normalized:
+        return False
+    if normalized in AUTH_RETRY_SKIP_STATUSES:
+        return False
+    if normalized in AUTH_RETRY_EXACT_STATUSES:
+        return True
+    return "token" in normalized or "auth" in normalized
+
+
 def filter_gofile_urls(raw_lines: List[str]) -> Tuple[List[str], List[str]]:
     """Trim, validate, and split URL lines into valid and invalid lists."""
     valid_urls: List[str] = []
@@ -116,6 +171,169 @@ def collect_batch_urls(input_fn: Callable[[str], str] = input) -> List[str]:
         collected.append(cleaned)
 
     return collected
+
+
+def _read_payload_source(payload_source: str) -> str:
+    """Read payload text from file path or stdin ('-')."""
+    try:
+        if payload_source == "-":
+            raw_payload = sys.stdin.read()
+        else:
+            with open(payload_source, "r", encoding="utf-8") as payload_fp:
+                raw_payload = payload_fp.read()
+    except OSError as e:
+        raise ValueError(f"Cannot read content payload source '{payload_source}': {e}") from e
+
+    if not raw_payload.strip():
+        raise ValueError("Content payload source is empty")
+
+    return raw_payload
+
+
+def load_content_payloads(payload_source: str) -> List[Dict[str, Any]]:
+    """Load one or more content payload objects from JSON/JSON array/JSONL."""
+    raw_payload = _read_payload_source(payload_source)
+
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as e:
+        payloads: List[Dict[str, Any]] = []
+        for line_no, line in enumerate(raw_payload.splitlines(), start=1):
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            try:
+                line_payload = json.loads(cleaned)
+            except json.JSONDecodeError as line_error:
+                raise ValueError(
+                    f"Content payload is not valid JSON/JSONL (line {line_no}): {line_error}"
+                ) from line_error
+            if not isinstance(line_payload, dict):
+                raise ValueError(f"JSONL payload line {line_no} must be a JSON object")
+            payloads.append(line_payload)
+
+        if not payloads:
+            raise ValueError(f"Content payload is not valid JSON: {e}") from e
+
+        return payloads
+
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        if not payload:
+            raise ValueError("Content payload array is empty")
+        for index, item in enumerate(payload, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Content payload array item {index} must be a JSON object")
+        return payload
+
+    raise ValueError("Content payload must be a JSON object, JSON object array, or JSONL")
+
+
+def load_content_payload(payload_source: str) -> Dict[str, Any]:
+    """Load exactly one GoFile content API payload from file path or stdin ('-')."""
+    payloads = load_content_payloads(payload_source)
+    if len(payloads) != 1:
+        raise ValueError(f"Expected exactly one payload, got {len(payloads)}")
+
+    payload = payloads[0]
+
+    if not isinstance(payload, dict):
+        raise ValueError("Content payload must be a JSON object")
+
+    return payload
+
+
+def _normalize_payload_name(name: Any, fallback: str, strip_emojis: bool) -> str:
+    """Sanitize payload-provided folder/file names with fallback value."""
+    normalized = str(name).strip() if name is not None else ""
+    if strip_emojis and normalized:
+        normalized = strip_emojis_func(normalized)
+    if not normalized:
+        normalized = fallback
+    return normalized
+
+
+def _walk_payload_node(
+    node: Dict[str, Any],
+    current_dir: str,
+    jobs: List[Tuple[str, str]],
+    strip_emojis: bool,
+    node_id: str = "",
+) -> None:
+    """Recursively walk payload node and collect downloadable file links."""
+    node_type = str(node.get("type", "file")).lower()
+
+    if node_type == "folder":
+        fallback_folder_name = f"folder_{node_id[:8]}" if node_id else "folder"
+        folder_name = _normalize_payload_name(
+            node.get("name"), fallback_folder_name, strip_emojis
+        )
+        folder_path = os.path.join(current_dir, sanitize_filename(folder_name))
+
+        children = node.get("children")
+        if not isinstance(children, dict) or not children:
+            children = node.get("contents")
+
+        if isinstance(children, dict):
+            for child_id, child in children.items():
+                if not isinstance(child, dict):
+                    continue
+                _walk_payload_node(
+                    node=child,
+                    current_dir=folder_path,
+                    jobs=jobs,
+                    strip_emojis=strip_emojis,
+                    node_id=str(child_id),
+                )
+            return
+
+        logger.warning(
+            "Payload folder '%s' has no embedded children; skipping nested traversal",
+            folder_name,
+        )
+        return
+
+    link = node.get("link")
+    if not isinstance(link, str) or not link.strip():
+        logger.warning("Skipping payload file without direct link")
+        return
+
+    fallback_file_name = f"file_{node_id[:8]}" if node_id else "file"
+    file_name = _normalize_payload_name(node.get("name"), fallback_file_name, strip_emojis)
+    file_path = os.path.join(current_dir, sanitize_filename(file_name))
+    jobs.append((link, file_path))
+
+
+def collect_download_jobs_from_payload(
+    payload: Dict[str, Any],
+    base_dir: str,
+    strip_emojis: bool = False,
+) -> List[Tuple[str, str]]:
+    """
+    Convert a raw GoFile content payload into downloadable (link, path) jobs.
+
+    Accepts either the full API response shape (`{"status": "ok", "data": {...}}`)
+    or a direct content node object (`{"type": "folder"|"file", ...}`).
+    """
+    root_node: Any = payload
+    if "status" in payload:
+        status, details = parse_api_error_details(payload)
+        if status != "ok":
+            raise ValueError(f"Payload status is '{status}': {details}")
+        root_node = payload.get("data")
+
+    if not isinstance(root_node, dict):
+        raise ValueError("Payload missing root content object in 'data'")
+
+    jobs: List[Tuple[str, str]] = []
+    _walk_payload_node(
+        node=root_node,
+        current_dir=base_dir,
+        jobs=jobs,
+        strip_emojis=strip_emojis,
+    )
+    return jobs
 
 def strip_emojis_func(text: str) -> str:
     """
@@ -438,7 +656,8 @@ class GoFile(metaclass=GoFileMeta):
             logger.error(f"Cannot get token: {e}")
             return
 
-        if data.get("status") == "ok":
+        status, details = parse_api_error_details(data)
+        if status == "ok":
             self.token = data["data"].get("token", "")
             if self.token:
                 self._save_credential_cache(token_updated=True)
@@ -446,7 +665,7 @@ class GoFile(metaclass=GoFileMeta):
             else:
                 logger.error("Token response did not contain token value")
         else:
-            logger.error("Cannot get token")
+            logger.error(f"Cannot get token [{status}]: {details}")
     
     def update_wt(self, force_refresh: bool = False) -> None:
         """
@@ -551,8 +770,11 @@ class GoFile(metaclass=GoFileMeta):
                 logger.error(f"Failed to fetch content {content_id}: {e}")
                 return
             if data.get("status") != "ok":
-                if auth_retry:
-                    logger.warning("API error, forcing credential refresh and retrying once")
+                status, details = parse_api_error_details(data)
+                if auth_retry and should_refresh_auth(status):
+                    logger.warning(
+                        f"API error [{status}], forcing credential refresh and retrying once: {details}"
+                    )
                     self.update_token(force_refresh=True)
                     self.update_wt(force_refresh=True)
                     self.execute(
@@ -576,7 +798,7 @@ class GoFile(metaclass=GoFileMeta):
                     )
                     return
 
-                logger.error("API error: %s", data)
+                logger.error(f"API error [{status}]: {details}")
                 return
             if data["data"].get("passwordStatus", "passwordOk") != "passwordOk":
                 logger.error("Invalid password: %s", data["data"].get("passwordStatus"))
@@ -789,6 +1011,52 @@ class GoFile(metaclass=GoFileMeta):
             )
         else:
             logger.error("Invalid parameters")
+
+    def execute_payload(
+        self,
+        dir: str,
+        payload: Dict[str, Any],
+        progress_callback: Optional[Callable[[int], None]] = None,
+        cancel_event: Optional[Any] = None,
+        overall_progress_callback: Optional[Callable[[int, str], None]] = None,
+        file_progress_callback: Optional[Callable[..., None]] = None,
+        pause_callback: Optional[Callable[[], bool]] = None,
+        throttle_speed: Optional[int] = None,
+        retry_attempts: int = 0,
+        strip_emojis: bool = False,
+    ) -> None:
+        """Download files directly from a pre-fetched content payload."""
+        jobs = collect_download_jobs_from_payload(payload, base_dir=dir, strip_emojis=strip_emojis)
+        if not jobs:
+            logger.warning("No downloadable links found in provided payload")
+            return
+
+        total_jobs = len(jobs)
+        for index, (link, file_path) in enumerate(jobs, start=1):
+            if cancel_event and cancel_event.is_set():
+                logger.info("Payload download cancelled")
+                break
+
+            logger.info(f"Downloading payload file {index}/{total_jobs}: {file_path}")
+            if callable(file_progress_callback):
+                file_progress_callback(file_path, 0)
+
+            self.download(
+                link=link,
+                file=file_path,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                file_progress_callback=file_progress_callback,
+                pause_callback=pause_callback,
+                throttle_speed=throttle_speed,
+                retry_attempts=retry_attempts,
+            )
+
+            if callable(file_progress_callback):
+                file_progress_callback(file_path, 100)
+            if callable(overall_progress_callback):
+                overall_percent = int(index * 100 / total_jobs)
+                overall_progress_callback(overall_percent, "payload")
     
     def download(self, 
                 link: str, 
@@ -930,6 +1198,12 @@ def main(
         help="reuse an existing account token; supports raw token or data.token=...",
     )
     parser.add_argument(
+        "--content-payload-file",
+        type=str,
+        dest="content_payload_file",
+        help="download from a raw /contents API JSON payload file (use '-' for stdin)",
+    )
+    parser.add_argument(
         "--refresh-auth",
         action="store_true",
         help="force refresh account token and website token before download",
@@ -937,20 +1211,6 @@ def main(
     args = parser.parse_args(argv)
 
     out_dir = args.dir if args.dir is not None else "./output"
-
-    if args.url:
-        raw_urls = [args.url]
-    else:
-        logger.info("Batch mode: enter one URL per line, then press Enter twice to start")
-        raw_urls = collect_batch_urls(input_fn=input_fn)
-
-    urls, invalid_lines = filter_gofile_urls(raw_urls)
-    if invalid_lines:
-        logger.warning(f"Skipped {len(invalid_lines)} invalid URL line(s)")
-
-    if not urls:
-        logger.error("No valid GoFile URLs provided")
-        return 1
 
     gofile_client = gofile_factory()
     manual_account_token = None
@@ -967,6 +1227,47 @@ def main(
         gofile_client.token = manual_account_token
         if hasattr(gofile_client, "_save_credential_cache"):
             gofile_client._save_credential_cache(token_updated=True)
+
+    if args.content_payload_file:
+        try:
+            payloads = load_content_payloads(args.content_payload_file)
+            logger.info(f"Loaded {len(payloads)} payload object(s)")
+            for payload_index, payload in enumerate(payloads, start=1):
+                logger.info(f"Starting payload {payload_index}/{len(payloads)}")
+                if hasattr(gofile_client, "execute_payload"):
+                    gofile_client.execute_payload(
+                        dir=out_dir,
+                        payload=payload,
+                        progress_callback=lambda p: logger.info(f"Overall progress: {p}%"),
+                        overall_progress_callback=lambda p, eta: logger.info(
+                            f"Overall progress: {p}% | ETA: {eta}"
+                        ),
+                        file_progress_callback=lambda f, p, size=None, **kwargs: logger.info(
+                            f"File {f} progress: {p}%"
+                        ),
+                    )
+                else:
+                    jobs = collect_download_jobs_from_payload(payload, base_dir=out_dir)
+                    for link, file_path in jobs:
+                        gofile_client.download(link, file_path)
+            return 0
+        except ValueError as payload_error:
+            logger.error(f"Invalid content payload: {payload_error}")
+            return 1
+
+    if args.url:
+        raw_urls = [args.url]
+    else:
+        logger.info("Batch mode: enter one URL per line, then press Enter twice to start")
+        raw_urls = collect_batch_urls(input_fn=input_fn)
+
+    urls, invalid_lines = filter_gofile_urls(raw_urls)
+    if invalid_lines:
+        logger.warning(f"Skipped {len(invalid_lines)} invalid URL line(s)")
+
+    if not urls:
+        logger.error("No valid GoFile URLs provided")
+        return 1
 
     for index, url in enumerate(urls, start=1):
         logger.info(f"Starting download {index}/{len(urls)}: {url}")

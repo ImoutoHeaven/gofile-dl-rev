@@ -84,6 +84,15 @@ python run.py -d "./output"
 
 # Reuse an existing account token (supports raw token or data.token=...)
 python run.py --account-token "data.token=YOUR_TOKEN" -d "./output"
+
+# Payload mode: skip /contents API calls and download from raw payload JSON
+python run.py --content-payload-file payload.json --account-token "data.token=YOUR_TOKEN" -d "./output"
+
+# Payload mode from stdin
+cat payload.json | python run.py --content-payload-file - -d "./output"
+
+# Batch payload mode (JSON Lines: one payload JSON per line)
+python run.py --content-payload-file payloads.jsonl -d "./output"
 ```
 
 Batch mode behavior:
@@ -92,6 +101,13 @@ Batch mode behavior:
 - Empty lines are ignored
 - Invalid lines are skipped automatically
 - Download starts immediately after two consecutive blank lines (double Enter)
+
+Payload mode behavior:
+
+- Accepts a raw `GET /contents/{id}` JSON response (`status=data` format)
+- Extracts direct `link` values recursively and downloads without calling `/contents` again
+- Useful when `/contents` endpoint is rate-limited from your current IP
+- Supports single JSON object, JSON object array, or JSON Lines batch input
 
 Credential cache behavior (for lower GoFile account creation pressure):
 
