@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoFile Payload Exporter (JSONL)
 // @namespace    https://gofile.io/
-// @version      0.4.2
+// @version      0.5.0
 // @description  Batch fetch GoFile /contents payloads from real browser session and export JSONL.
 // @author       OpenCode
 // @match        https://gofile.io/*
@@ -29,6 +29,7 @@
     running: false,
     outputJsonl: "",
     outputBundleBase64: "",
+    outputDirectLinks: "",
     failures: [],
   };
 
@@ -792,6 +793,25 @@
         margin-top: 8px;
         font-size: 13px;
       }
+      .gpx-cookie-header {
+        margin-top: 8px;
+        padding: 8px;
+        background: #fff;
+        border: 1px solid #c2cee0;
+        border-radius: 8px;
+        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        cursor: pointer;
+        word-break: break-all;
+      }
+      .gpx-cookie-header:hover {
+        background: #f0f4f8;
+      }
+      .gpx-section-title {
+        font-weight: 600;
+        font-size: 13px;
+        margin-top: 12px;
+        margin-bottom: 4px;
+      }
     `;
 
     document.head.appendChild(style);
@@ -821,6 +841,8 @@
         <div class="gpx-title">GoFile /contents -> compat JSONL</div>
         <button type="button" class="gpx-close" data-gpx-close="1">Close</button>
       </div>
+      <div class="gpx-section-title">Aria2 Cookie Header (click to copy)</div>
+      <div class="gpx-cookie-header" data-gpx-cookie-header title="Click to copy">Cookie: accountToken=...</div>
       <textarea class="gpx-textarea" data-gpx-input placeholder="One gofile.io/d/... URL per line"></textarea>
       <div class="gpx-options">
         <label>Delay(ms)<input type="number" min="0" step="100" value="800" data-gpx-delay></label>
@@ -832,6 +854,7 @@
         <button type="button" data-gpx-download>Download JSONL</button>
         <button type="button" data-gpx-copy-bundle>Copy Bundle (base64)</button>
         <button type="button" data-gpx-download-bundle>Download Bundle</button>
+        <button type="button" data-gpx-copy-links>Copy Direct Links</button>
         <button type="button" data-gpx-clear>Clear</button>
       </div>
       <div class="gpx-status" data-gpx-status>Idle</div>
@@ -848,6 +871,7 @@
       overlay,
       panel,
       input: panel.querySelector("[data-gpx-input]"),
+      cookieHeader: panel.querySelector("[data-gpx-cookie-header]"),
       delayInput: panel.querySelector("[data-gpx-delay]"),
       retriesInput: panel.querySelector("[data-gpx-retries]"),
       captureButton: panel.querySelector("[data-gpx-capture]"),
@@ -855,6 +879,7 @@
       downloadButton: panel.querySelector("[data-gpx-download]"),
       copyBundleButton: panel.querySelector("[data-gpx-copy-bundle]"),
       downloadBundleButton: panel.querySelector("[data-gpx-download-bundle]"),
+      copyLinksButton: panel.querySelector("[data-gpx-copy-links]"),
       clearButton: panel.querySelector("[data-gpx-clear]"),
       closeButton: panel.querySelector("[data-gpx-close]"),
       status: panel.querySelector("[data-gpx-status]"),
@@ -883,6 +908,7 @@
       refs.downloadButton.disabled = running;
       refs.copyBundleButton.disabled = running;
       refs.downloadBundleButton.disabled = running;
+      refs.copyLinksButton.disabled = running;
       refs.clearButton.disabled = running;
       refs.input.disabled = running;
       refs.delayInput.disabled = running;
@@ -1091,9 +1117,40 @@
       await expandFolderNodeChildren(payload.data, options, logPrefix, cache, seenCodes, 0);
     }
 
+    function extractDirectLinks(payloads) {
+      const links = [];
+      
+      function collectLinksFromNode(node) {
+        if (!node || typeof node !== "object") {
+          return;
+        }
+        
+        // If this is a file, add its link
+        if (String(node.type || "").toLowerCase() === "file" && node.link) {
+          links.push(node.link);
+        }
+        
+        // Recursively process children
+        if (node.children && typeof node.children === "object") {
+          for (const childId of Object.keys(node.children)) {
+            collectLinksFromNode(node.children[childId]);
+          }
+        }
+      }
+      
+      for (const payload of payloads) {
+        if (payload && payload.status === "ok" && payload.data) {
+          collectLinksFromNode(payload.data);
+        }
+      }
+      
+      return links.join("\n");
+    }
+
     function applyResults(successPayloads, failures) {
       state.outputJsonl = successPayloads.map((payload) => JSON.stringify(payload)).join("\n");
       state.outputBundleBase64 = buildPayloadBundleBase64(state.outputJsonl);
+      state.outputDirectLinks = extractDirectLinks(successPayloads);
       state.failures = failures;
       refs.output.value = state.outputJsonl;
 
@@ -1263,15 +1320,57 @@
     function handleClear() {
       state.outputJsonl = "";
       state.outputBundleBase64 = "";
+      state.outputDirectLinks = "";
       state.failures = [];
       refs.output.value = "";
       refs.log.textContent = "";
       setStatus("Cleared output.");
     }
 
+    async function handleCopyLinks() {
+      if (!state.outputDirectLinks) {
+        setStatus("No direct links to copy.");
+        return;
+      }
+      try {
+        const copied = await copyText(state.outputDirectLinks);
+        const linkCount = state.outputDirectLinks.split("\n").filter(Boolean).length;
+        setStatus(copied ? `Copied ${linkCount} direct link(s) to clipboard.` : "Clipboard not available in this context.");
+      } catch (error) {
+        setStatus(`Copy links failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    function updateCookieHeaderDisplay() {
+      const token = resolveAccountToken();
+      if (token) {
+        refs.cookieHeader.textContent = `Cookie: accountToken=${token}`;
+      } else {
+        refs.cookieHeader.textContent = "Cookie: accountToken=... (not found)";
+      }
+    }
+
+    async function handleCookieHeaderClick() {
+      const token = resolveAccountToken();
+      if (!token) {
+        setStatus("Account token not found.");
+        return;
+      }
+      const cookieHeaderText = `Cookie: accountToken=${token}`;
+      try {
+        const copied = await copyText(cookieHeaderText);
+        setStatus(copied ? "Copied aria2 cookie header to clipboard." : "Clipboard not available in this context.");
+      } catch (error) {
+        setStatus(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
     refs.button.addEventListener("click", () => setOpen(true));
     refs.overlay.addEventListener("click", () => setOpen(false));
     refs.closeButton.addEventListener("click", () => setOpen(false));
+    refs.cookieHeader.addEventListener("click", () => {
+      void handleCookieHeaderClick();
+    });
     refs.captureButton.addEventListener("click", () => {
       void handleCapture();
     });
@@ -1283,8 +1382,12 @@
       void handleCopyBundle();
     });
     refs.downloadBundleButton.addEventListener("click", handleDownloadBundle);
+    refs.copyLinksButton.addEventListener("click", () => {
+      void handleCopyLinks();
+    });
     refs.clearButton.addEventListener("click", handleClear);
 
+    updateCookieHeaderDisplay();
     setStatus("Idle");
   }
 
